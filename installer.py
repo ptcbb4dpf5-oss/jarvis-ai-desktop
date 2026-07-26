@@ -86,22 +86,46 @@ def _merge(src: str, dst: str) -> None:
 
 
 def run_setup(folder: str, log) -> None:
-    """Create venv + install dependencies by invoking setup.bat (Windows) or pip."""
-    if os.name == "nt":
-        setup = os.path.join(folder, "setup.bat")
-        if os.path.exists(setup):
-            log("Running setup.bat (creating venv + installing dependencies)…")
-            subprocess.run(["cmd", "/c", setup], cwd=folder)
-            return
-    # Cross-platform fallback.
-    log("Creating virtual environment…")
+    """Create a venv and install all dependencies.
+
+    Uses ``sys.executable`` (the exact interpreter running this installer) rather
+    than a bare ``python`` on PATH. This is essential on a brand-new PC where
+    Python was just installed in the same session — PATH isn't refreshed yet, so
+    a bare ``python``/``setup.bat`` would fail or hit the Store stub.
+    """
+    is_win = os.name == "nt"
     venv_dir = os.path.join(folder, ".venv")
-    subprocess.run([sys.executable, "-m", "venv", venv_dir])
-    pip = os.path.join(venv_dir, "Scripts" if os.name == "nt" else "bin",
-                       "pip" + (".exe" if os.name == "nt" else ""))
+
+    log("Creating virtual environment (.venv)…")
+    r = subprocess.run([sys.executable, "-m", "venv", venv_dir],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        log("venv creation failed; installing into the base interpreter instead.")
+        venv_py = sys.executable
+    else:
+        venv_py = os.path.join(venv_dir, "Scripts" if is_win else "bin",
+                               "python.exe" if is_win else "python")
+        if not os.path.exists(venv_py):
+            venv_py = sys.executable
+
+    def pip(*args) -> int:
+        return subprocess.run([venv_py, "-m", "pip", *args]).returncode
+
+    log("Upgrading pip…")
+    pip("install", "--upgrade", "pip", "setuptools", "wheel")
+
     req = os.path.join(folder, "requirements.txt")
-    log("Installing dependencies (this can take a few minutes)…")
-    subprocess.run([pip, "install", "-r", req])
+    log("Installing dependencies (this can take several minutes)…")
+    rc = pip("install", "-r", req)
+    if rc != 0:
+        log("Some dependencies failed. Retrying PyAudio via pipwin…")
+        pip("install", "pipwin")
+        subprocess.run([venv_py, "-m", "pipwin", "install", "pyaudio"])
+
+    log("Downloading the Playwright browser (Chromium)…")
+    subprocess.run([venv_py, "-m", "playwright", "install", "chromium"])
+
+    log("Dependencies installed.")
 
 
 def make_shortcut(folder: str, log) -> None:

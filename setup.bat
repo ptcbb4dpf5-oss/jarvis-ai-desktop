@@ -14,23 +14,31 @@ echo    JARVIS v1  -  Setup
 echo  ============================================
 echo.
 
-REM --- 1. Check Python -------------------------------------------------
-where python >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Python was not found on your PATH.
-    echo         Install Python 3.11+ from https://www.python.org/downloads/
-    echo         and make sure "Add Python to PATH" is checked.
+REM --- 1. Check Python (ignoring the Microsoft Store stub) ------------
+REM The 'py' launcher is never shadowed by the Store stub, so try it first.
+set "PYCMD="
+py -3 --version >nul 2>&1 && set "PYCMD=py -3"
+if not defined PYCMD (
+    for /f "delims=" %%v in ('python --version 2^>nul') do (
+        echo %%v | findstr /b /c:"Python 3" >nul 2>&1 && set "PYCMD=python"
+    )
+)
+if not defined PYCMD (
+    echo [ERROR] A real Python 3 was not found.
+    echo         Either run Jarvis-Installer.bat ^(auto-installs Python^), or
+    echo         install Python 3.11+ from https://www.python.org/downloads/
+    echo         and tick "Add python.exe to PATH".
     pause
     exit /b 1
 )
 
-for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo [OK] Found Python %PYVER%
+for /f "delims=" %%v in ('%PYCMD% --version 2^>^&1') do set PYVER=%%v
+echo [OK] Found %PYVER%
 
 REM --- 2. Create virtual environment ---------------------------------
 if not exist ".venv" (
     echo [..] Creating virtual environment in .venv ...
-    python -m venv .venv
+    %PYCMD% -m venv .venv
     if errorlevel 1 (
         echo [ERROR] Failed to create virtual environment.
         pause
