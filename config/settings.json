@@ -1,0 +1,36 @@
+{
+  "llm": {
+    "api_key_env": "OPENAI_API_KEY",
+    "api_key": "",
+    "base_url": "",
+    "model": "gpt-4o-mini",
+    "temperature": 0.6,
+    "max_tokens": 800
+  },
+  "voice": {
+    "enabled": true,
+    "wake_word": "jarvis",
+    "require_wake_word": false,
+    "speak_responses": true,
+    "rate": 178,
+    "volume": 1.0,
+    "voice_hint": "",
+    "language": "en-US",
+    "stt_engine": "google"
+  },
+  "ui": {
+    "start_fullscreen": false,
+    "width": 1100,
+    "height": 720,
+    "fps": 60,
+    "show_hud_on_start": false
+  },
+  "plugins": {
+    "hot_reload": true,
+    "allow_unsafe_plugins": false
+  },
+  "browser": {
+    "headless": false,
+    "search_engine": "https://www.google.com/search?q="
+  }
+}
