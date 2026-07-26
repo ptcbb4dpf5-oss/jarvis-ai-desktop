@@ -1,9 +1,7 @@
 {
   "llm": {
-    "api_key_env": "OPENAI_API_KEY",
-    "api_key": "",
-    "base_url": "",
-    "model": "gpt-4o-mini",
+    "active": "auto",
+    "providers": {},
     "temperature": 0.6,
     "max_tokens": 800
   },

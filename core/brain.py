@@ -28,6 +28,8 @@ except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
     _OPENAI_AVAILABLE = False
 
+from core import providers as _providers
+
 
 SYSTEM_PROMPT = """You are JARVIS, a witty, hyper-capable Iron Man-style AI assistant
 running natively on the user's Windows PC. You are concise, confident, and helpful,
@@ -85,71 +87,124 @@ VALID_INTENTS = {
 class Brain:
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config or {}
-        llm_cfg = self.config.get("llm", {})
-
-        # Resolve API key: env var wins, then config file.
-        self.api_key = (
-            os.environ.get(llm_cfg.get("api_key_env", "OPENAI_API_KEY"))
-            or llm_cfg.get("api_key")
-            or os.environ.get("ABACUS_API_KEY")
-        )
-        self.base_url = llm_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL")
-        self.model = llm_cfg.get("model", "gpt-4o-mini")
-        self.temperature = float(llm_cfg.get("temperature", 0.6))
-        self.max_tokens = int(llm_cfg.get("max_tokens", 800))
-
-        self._client: Optional[Any] = None
-        self.online = False
-        self._init_client()
+        self.temperature = 0.6
+        self.max_tokens = 800
+        # Cache of OpenAI clients keyed by (api_key, base_url) so we don't rebuild
+        # a client on every request.
+        self._clients: Dict[tuple, Any] = {}
+        # The last provider we actually routed to (for UI display).
+        self.last_provider: Optional[str] = None
+        self.configure(self.config.get("llm", {}))
 
     # ------------------------------------------------------------------ #
-    def _init_client(self) -> None:
-        if not _OPENAI_AVAILABLE or not self.api_key:
-            self.online = False
-            return
-        try:
-            kwargs: Dict[str, Any] = {"api_key": self.api_key}
-            if self.base_url:
-                kwargs["base_url"] = self.base_url
-            self._client = OpenAI(**kwargs)
-            self.online = True
-        except Exception:
-            self._client = None
-            self.online = False
-
     def configure(self, llm_cfg: Dict[str, Any]) -> bool:
-        """Re-apply LLM settings live (e.g. after the user pastes an API key in
-        the Settings dialog) and rebuild the client. Returns is_online."""
+        """Re-apply LLM settings live (e.g. after the user connects a provider in
+        the Settings dialog). Returns is_online."""
         llm_cfg = llm_cfg or {}
+        # --- Back-compat: migrate the old single-key schema into providers. ---
+        llm_cfg = self._migrate(llm_cfg)
         self.config["llm"] = llm_cfg
-        self.api_key = (
-            os.environ.get(llm_cfg.get("api_key_env", "OPENAI_API_KEY"))
-            or llm_cfg.get("api_key")
-            or os.environ.get("ABACUS_API_KEY")
-        )
-        self.base_url = llm_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL")
-        self.model = llm_cfg.get("model", "gpt-4o-mini")
         self.temperature = float(llm_cfg.get("temperature", 0.6))
         self.max_tokens = int(llm_cfg.get("max_tokens", 800))
-        self._client = None
-        self.online = False
-        self._init_client()
+        self._clients.clear()
         return self.is_online
+
+    @staticmethod
+    def _migrate(llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Fold a legacy {api_key, base_url, model} into the providers map, and
+        pull any provider keys from environment variables."""
+        llm_cfg = dict(llm_cfg)
+        provs = dict(llm_cfg.get("providers", {}))
+
+        # Legacy single key -> OpenAI provider slot.
+        legacy_key = llm_cfg.get("api_key")
+        if legacy_key and not provs.get("openai", {}).get("api_key"):
+            provs["openai"] = {"api_key": legacy_key}
+            if llm_cfg.get("model"):
+                provs["openai"]["model"] = llm_cfg["model"]
+
+        # Environment variables per provider (never overwrite an explicit key).
+        env_map = {
+            "groq": "GROQ_API_KEY", "openai": "OPENAI_API_KEY",
+            "google": "GEMINI_API_KEY", "mistral": "MISTRAL_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+        }
+        for pid, env in env_map.items():
+            val = os.environ.get(env)
+            if val and not provs.get(pid, {}).get("api_key"):
+                provs.setdefault(pid, {})["api_key"] = val
+
+        llm_cfg["providers"] = provs
+        llm_cfg.setdefault("active", "auto")
+        return llm_cfg
+
+    # ------------------------------------------------------------------ #
+    def _get_client(self, api_key: str, base_url: str):
+        key = (api_key, base_url)
+        if key in self._clients:
+            return self._clients[key]
+        if not _OPENAI_AVAILABLE or not api_key:
+            return None
+        try:
+            kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            self._clients[key] = client
+            return client
+        except Exception:
+            return None
+
+    def _route(self, hint: str = ""):
+        """Pick a provider for this request. Returns (client, model, label) or
+        (None, None, None) if nothing is connected."""
+        creds = _providers.resolve(self.config.get("llm", {}), hint=hint)
+        if not creds:
+            return None, None, None
+        client = self._get_client(creds["api_key"], creds["base_url"])
+        if not client:
+            return None, None, None
+        self.last_provider = creds["label"]
+        return client, creds["model"], creds["label"]
 
     @property
     def is_online(self) -> bool:
-        return self.online and self._client is not None
+        """Online if at least one provider is connected and openai SDK present."""
+        if not _OPENAI_AVAILABLE:
+            return False
+        llm = self.config.get("llm", {})
+        return bool(_providers.connected_providers(llm)
+                    or _providers.connected_agents(llm))
+
+    def status_line(self) -> str:
+        """Human-readable summary of connected providers for the UI."""
+        llm = self.config.get("llm", {})
+        provs = _providers.connected_providers(llm)
+        agents = _providers.connected_agents(llm)
+        if not provs and not agents:
+            return "OFFLINE — no AI provider connected. Open Settings (gear) to add a key."
+        names = [ _providers.PROVIDERS[p]["label"] for p in provs ]
+        names += [ _providers.AGENTS[a]["label"] for a in agents ]
+        return "Connected: " + ", ".join(names)
 
     # ------------------------------------------------------------------ #
     # Raw chat
     # ------------------------------------------------------------------ #
     def chat(self, messages: List[Dict[str, str]]) -> str:
         """Return a natural-language completion for the given messages."""
-        if not self.is_online:
+        # Route based on the latest user message so Jarvis picks the best
+        # connected provider for the request.
+        hint = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                hint = m.get("content", "")
+                break
+        client, model, _label = self._route(hint)
+        if not client:
             return self._offline_reply(messages)
         try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
+            resp = client.chat.completions.create(
+                model=model,
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -170,6 +225,10 @@ class Brain:
         if not self.is_online:
             return rule
 
+        client, model, _label = self._route(user_text)
+        if not client:
+            return rule
+
         messages: List[Dict[str, str]] = [{"role": "system", "content": INTENT_PROMPT}]
         if context:
             # Include a little conversation context to disambiguate references.
@@ -177,8 +236,8 @@ class Brain:
         messages.append({"role": "user", "content": user_text})
 
         try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
+            resp = client.chat.completions.create(
+                model=model,
                 messages=messages,
                 temperature=0.0,
                 max_tokens=400,
@@ -340,9 +399,13 @@ class Brain:
         user_prompt = instruction
         if extra_context:
             user_prompt += "\n\nContext:\n" + extra_context
+        # Prefer a code-strong provider for code generation.
+        client, model, _label = self._route("write python code " + instruction)
+        if not client:
+            return ""
         try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
+            resp = client.chat.completions.create(
+                model=model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
