@@ -59,6 +59,137 @@ except Exception:  # pragma: no cover
 # This is an ElevenLabs stock voice id ("George" — British, warm/authoritative).
 DEFAULT_JARVIS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 
+# A small curated set of ElevenLabs *stock* voices that suit a JARVIS-style
+# assistant. These ids are public premade voices in every ElevenLabs account,
+# so the user never has to hunt for a "voice id" — they just pick a name.
+JARVIS_VOICES = [
+    {"id": "JBFqnCBsd6RMkjVDRZzb", "label": "George — British, warm (classic JARVIS)"},
+    {"id": "onwK4e9ZLuTAKqWW03F9", "label": "Daniel — British, authoritative news"},
+    {"id": "nPczCjzI2devNBz1zQrb", "label": "Brian — deep, cinematic narrator"},
+    {"id": "pNInz6obpgDQGcFmaJgB", "label": "Adam — deep American"},
+    {"id": "IKne3meq5aSn9XLyUdCD", "label": "Charlie — natural, conversational"},
+    {"id": "TX3LPaxmHKxFdv7VOQHJ", "label": "Liam — crisp, youthful"},
+]
+
+
+def voice_label_for(voice_id: str) -> str:
+    for v in JARVIS_VOICES:
+        if v["id"] == voice_id:
+            return v["label"]
+    return voice_id or DEFAULT_JARVIS_VOICE_ID
+
+
+# --------------------------------------------------------------------------- #
+# Module-level ElevenLabs helpers (shared by VoiceSpeaker + the Settings "Test
+# voice" button, so both use exactly the same synthesis + playback path).
+# --------------------------------------------------------------------------- #
+def _pcm_to_wav_file(pcm: bytes, rate: int = 24000) -> Optional[str]:
+    try:
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_tts_")
+        os.close(fd)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)  # 16-bit
+            w.setframerate(rate)
+            w.writeframes(pcm)
+        return path
+    except Exception:
+        return None
+
+
+def play_wav_file(path: str) -> bool:
+    """Play a WAV file blocking until done, cross-platform, best-effort."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import winsound  # type: ignore
+            winsound.PlaySound(path, winsound.SND_FILENAME)
+            return True
+    except Exception:
+        pass
+    for player in ("afplay", "aplay", "ffplay", "paplay"):
+        exe = shutil.which(player)
+        if not exe:
+            continue
+        try:
+            if player == "ffplay":
+                cmd = [exe, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+            elif player == "aplay":
+                cmd = [exe, "-q", path]
+            else:
+                cmd = [exe, path]
+            subprocess.run(cmd, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def eleven_synthesize(api_key: str, voice_id: str, text: str,
+                      model: str = "eleven_turbo_v2_5"):
+    """Call ElevenLabs TTS. Returns (pcm_bytes|None, error_message)."""
+    if not _REQUESTS:
+        return None, "The 'requests' library isn't installed."
+    if not api_key:
+        return None, "No ElevenLabs API key set."
+    voice_id = voice_id or DEFAULT_JARVIS_VOICE_ID
+    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+           f"?output_format=pcm_24000")
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/pcm",
+    }
+    payload = {
+        "text": text,
+        "model_id": model or "eleven_turbo_v2_5",
+        "voice_settings": {
+            "stability": 0.45,
+            "similarity_boost": 0.85,
+            "style": 0.15,
+            "use_speaker_boost": True,
+        },
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    except Exception as exc:
+        return None, f"Network error reaching ElevenLabs: {exc}"
+    if resp.status_code == 200 and resp.content:
+        return resp.content, ""
+    if resp.status_code in (401, 403):
+        return None, "API key rejected (401/403). Check the key is correct."
+    if resp.status_code == 422:
+        return None, "Voice id not accepted (422). Pick a different voice."
+    if resp.status_code == 429:
+        return None, "ElevenLabs quota/limit reached (429)."
+    detail = ""
+    try:
+        detail = resp.text[:160]
+    except Exception:
+        pass
+    return None, f"ElevenLabs error {resp.status_code}. {detail}"
+
+
+def eleven_speak(api_key: str, voice_id: str, text: str,
+                 model: str = "eleven_turbo_v2_5"):
+    """Synthesize + play a sample. Returns (ok, message)."""
+    pcm, err = eleven_synthesize(api_key, voice_id, text, model)
+    if pcm is None:
+        return False, err
+    wav = _pcm_to_wav_file(pcm, rate=24000)
+    if not wav:
+        return False, "Couldn't build the audio file."
+    played = play_wav_file(wav)
+    try:
+        os.remove(wav)
+    except Exception:
+        pass
+    if not played:
+        return False, ("Audio was generated but no player was found to play it "
+                       "(this is normal off-Windows).")
+    return True, "Voice test played successfully."
+
 
 # --------------------------------------------------------------------------- #
 class VoiceListener(QThread):
@@ -372,88 +503,22 @@ class VoiceSpeaker(QThread):
         """
         if not (_REQUESTS and self.eleven_api_key):
             return False
-        voice_id = self.eleven_voice_id or DEFAULT_JARVIS_VOICE_ID
-        url = (f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-               f"?output_format=pcm_24000")
-        headers = {
-            "xi-api-key": self.eleven_api_key,
-            "Content-Type": "application/json",
-            "Accept": "audio/pcm",
-        }
-        payload = {
-            "text": text,
-            "model_id": self.eleven_model or "eleven_turbo_v2_5",
-            "voice_settings": {
-                "stability": 0.45,
-                "similarity_boost": 0.85,
-                "style": 0.15,
-                "use_speaker_boost": True,
-            },
-        }
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=30)
-            if resp.status_code != 200 or not resp.content:
-                self._eleven_ok = False
-                if resp.status_code in (401, 403):
-                    self.unavailable.emit(
-                        "ElevenLabs key rejected — falling back to system voice."
-                    )
-                return False
-            self._eleven_ok = True
-            # ElevenLabs pcm_24000 = raw 16-bit mono PCM @ 24 kHz. Wrap as WAV.
-            wav_path = self._pcm_to_wav(resp.content, rate=24000)
-            if not wav_path:
-                return False
-            played = self._play_wav(wav_path)
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
-            return played
-        except Exception:
+        pcm, err = eleven_synthesize(
+            self.eleven_api_key, self.eleven_voice_id or DEFAULT_JARVIS_VOICE_ID,
+            text, self.eleven_model or "eleven_turbo_v2_5")
+        if pcm is None:
             self._eleven_ok = False
+            if err:
+                self.unavailable.emit(f"ElevenLabs: {err} — using system voice.")
             return False
-
-    @staticmethod
-    def _pcm_to_wav(pcm: bytes, rate: int = 24000) -> Optional[str]:
+        self._eleven_ok = True
+        # ElevenLabs pcm_24000 = raw 16-bit mono PCM @ 24 kHz. Wrap as WAV.
+        wav_path = _pcm_to_wav_file(pcm, rate=24000)
+        if not wav_path:
+            return False
+        played = play_wav_file(wav_path)
         try:
-            fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_tts_")
-            os.close(fd)
-            with wave.open(path, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)  # 16-bit
-                w.setframerate(rate)
-                w.writeframes(pcm)
-            return path
-        except Exception:
-            return None
-
-    def _play_wav(self, path: str) -> bool:
-        """Play a WAV file blocking until done, cross-platform, best-effort."""
-        system = platform.system()
-        try:
-            if system == "Windows":
-                import winsound  # type: ignore
-                winsound.PlaySound(path, winsound.SND_FILENAME)
-                return True
+            os.remove(wav_path)
         except Exception:
             pass
-        # macOS / Linux: try common players in order.
-        for player in ("afplay", "aplay", "ffplay", "paplay"):
-            exe = shutil.which(player)
-            if not exe:
-                continue
-            try:
-                if player == "ffplay":
-                    cmd = [exe, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
-                elif player == "aplay":
-                    cmd = [exe, "-q", path]
-                else:
-                    cmd = [exe, path]
-                subprocess.run(cmd, check=True,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-                return True
-            except Exception:
-                continue
-        return False
+        return played

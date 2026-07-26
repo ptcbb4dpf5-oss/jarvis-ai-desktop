@@ -18,6 +18,7 @@ if third-party packages are broken.
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -199,6 +200,119 @@ class Updater:
         """Relaunch the current Python process to load the new code."""
         python = sys.executable
         os.execl(python, python, *sys.argv)
+
+
+class SafeBoot:
+    """Crash-recovery guard — rolls Jarvis back to the last safe version.
+
+    How it works (all stdlib, so it runs even if third-party packages break):
+
+    * Right before the UI starts, ``mark_boot_start()`` drops a small flag file
+      (``config/.boot_incomplete``).
+    * A few seconds after the window is shown, ``mark_boot_ok()`` deletes it —
+      meaning "this version booted fine".
+    * If Jarvis crashes during startup the flag is left behind. On the NEXT
+      launch ``needs_recovery()`` sees the leftover flag and Jarvis restores the
+      code files from the most recent safe backup (recorded by
+      ``ProjectManager.promote_pending`` in ``config/last_safe.json``), so a bad
+      self-update never leaves the user with a broken app.
+    """
+
+    FLAG_NAME = ".boot_incomplete"
+    POINTER_NAME = "last_safe.json"
+
+    def __init__(self, root: Optional[str] = None, log: Optional[Logger] = None):
+        self.root = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.log = log or (lambda m: print(m))
+        self.cfg_dir = os.path.join(self.root, "config")
+
+    # -- flag file ------------------------------------------------------- #
+    def _flag_path(self) -> str:
+        return os.path.join(self.cfg_dir, self.FLAG_NAME)
+
+    def mark_boot_start(self) -> None:
+        try:
+            os.makedirs(self.cfg_dir, exist_ok=True)
+            with open(self._flag_path(), "w", encoding="utf-8") as fh:
+                fh.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as exc:
+            self.log(f"SafeBoot: could not write boot flag: {exc}")
+
+    def mark_boot_ok(self) -> None:
+        try:
+            p = self._flag_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as exc:
+            self.log(f"SafeBoot: could not clear boot flag: {exc}")
+
+    def needs_recovery(self) -> bool:
+        return os.path.exists(self._flag_path())
+
+    # -- safe-point pointer --------------------------------------------- #
+    def _pointer_path(self) -> str:
+        return os.path.join(self.cfg_dir, self.POINTER_NAME)
+
+    def record_safe_point(self, backup_dir: str) -> None:
+        try:
+            os.makedirs(self.cfg_dir, exist_ok=True)
+            with open(self._pointer_path(), "w", encoding="utf-8") as fh:
+                json.dump({"backup": backup_dir, "time": time.strftime("%Y-%m-%d %H:%M:%S")},
+                          fh, indent=2)
+        except Exception as exc:
+            self.log(f"SafeBoot: could not record safe point: {exc}")
+
+    def _last_safe_backup(self) -> Optional[str]:
+        try:
+            with open(self._pointer_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            backup = data.get("backup")
+            if backup and os.path.isdir(backup):
+                return backup
+        except Exception:
+            pass
+        return None
+
+    # -- recovery -------------------------------------------------------- #
+    def recover(self) -> dict:
+        """Restore code files from the last safe backup. Returns a result dict."""
+        backup = self._last_safe_backup()
+        if not backup:
+            # Nothing to roll back to — clear the flag so we don't loop.
+            self.mark_boot_ok()
+            return {"ok": False, "restored": 0,
+                    "message": "Previous start didn't finish, but no safe "
+                               "version was on record to roll back to."}
+        restored = 0
+        skip_dirs = {".git", "__pycache__", ".venv", "venv", "screenshots"}
+        skip_rel = {os.path.join("config", "settings.json")}
+        try:
+            for dirpath, dirs, fnames in os.walk(backup):
+                dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith("_jarvis_")]
+                for fn in fnames:
+                    if fn.endswith(".pyc"):
+                        continue
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, backup)
+                    if rel in skip_rel or rel.startswith("plugins" + os.sep):
+                        continue
+                    dst = os.path.join(self.root, rel)
+                    try:
+                        os.makedirs(os.path.dirname(dst) or self.root, exist_ok=True)
+                        shutil.copy2(full, dst)
+                        restored += 1
+                    except Exception as exc:
+                        self.log(f"SafeBoot: restore failed {rel}: {exc}")
+        except Exception as exc:
+            self.mark_boot_ok()
+            return {"ok": False, "restored": restored,
+                    "message": f"Roll back hit an error: {exc}"}
+        # Clear the flag so the recovered version gets a clean boot attempt.
+        self.mark_boot_ok()
+        return {"ok": True, "restored": restored,
+                "message": f"The last update wouldn't start, so Jarvis rolled "
+                           f"back to the previous safe version "
+                           f"({restored} file(s) restored)."}
 
 
 if __name__ == "__main__":

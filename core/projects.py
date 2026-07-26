@@ -59,6 +59,9 @@ class ProjectManager:
         # The most recent self-duplicate sandbox awaiting review/promotion.
         self._pending_sandbox: Optional[str] = None
         self._pending_summary: str = ""
+        self._pending_files: List[str] = []      # files changed in the sandbox
+        self._pending_request: str = ""          # the original change request
+        self._pending_plan: str = ""             # the agreed implementation plan
 
     # ------------------------------------------------------------------ #
     def log(self, msg: str) -> None:
@@ -264,6 +267,53 @@ class ProjectManager:
     # ================================================================== #
     # Self-development (read / duplicate / test / promote own code)
     # ================================================================== #
+    def plan_change(self, request: str) -> str:
+        """PLANNING PHASE — Jarvis decides HOW to implement a requested change to
+        himself and returns a clear, human-readable plan (no code yet).
+
+        The plan is stored so the next step (build_pending) can act on it. This is
+        the first step of the guided self-development flow:
+            plan → build & preview → tweak → test → update & restart.
+        """
+        request = (request or "").strip()
+        if not request:
+            return "Tell me what you'd like to change about me first."
+        self._pending_request = request
+        if not getattr(self.brain, "is_online", False):
+            self._pending_plan = ""
+            return ("I need an AI provider connected to plan this. Open Settings "
+                    "(gear) and paste a key (Groq is free), then try again.")
+
+        files = self._collect_source(self.app_root)
+        index = "\n".join(f"  {rel} ({len(src.splitlines())} lines)"
+                          for rel, src in files.items())
+        relevant = self._pick_relevant(files, request)
+        blob = "\n\n".join(f"=== {rel} ===\n{src}"
+                           for rel, src in relevant.items())[:12000]
+        prompt = (
+            "You are JARVIS, planning a change to your OWN source code. Do NOT "
+            "write the code yet. Produce a short, clear implementation PLAN a "
+            "non-technical person can follow. Use this exact shape:\n"
+            "GOAL: one sentence.\n"
+            "APPROACH: 2-4 sentences on the best way to do it.\n"
+            "FILES TO CHANGE: bullet list of real file names and what changes in each.\n"
+            "RISKS: any risk + how the safe-duplicate/backup protects them.\n"
+            "Keep it concise.\n\n"
+            f"CHANGE REQUEST: {request}\n\nFILE INDEX:\n{index}\n\nKEY FILES:\n{blob}"
+        )
+        try:
+            if self.reasoning:
+                plan = self.reasoning.answer(prompt, mode="reflect")
+            else:
+                plan = self.brain.chat([{"role": "user", "content": prompt}])
+        except Exception as exc:
+            return f"Couldn't draft a plan: {exc}"
+        self._pending_plan = plan or ""
+        return (f"PLAN for: {request}\n\n{plan}\n\n"
+                "If this looks good, press '② Build & preview' and I'll make a "
+                "safe duplicate and apply it there. Or refine the request and "
+                "plan again.")
+
     def read_own_code(self, query: str = "") -> str:
         """Summarise Jarvis's own architecture, optionally focused by a query."""
         files = self._collect_source(self.app_root)
@@ -284,15 +334,35 @@ class ProjectManager:
             return self.reasoning.answer(prompt, mode="reflect")
         return self.brain.chat([{"role": "user", "content": prompt}])
 
-    def create_self_duplicate(self, changes: str) -> str:
+    def build_pending(self, progress_cb: Optional[Callable[[str], None]] = None) -> str:
+        """Build & preview step — apply the currently planned change into a safe
+        duplicate. Uses the request captured by ``plan_change`` (or the last
+        request). Convenience wrapper around ``create_self_duplicate``."""
+        req = self._pending_request
+        if not req:
+            return ("There's nothing planned yet. Describe a change and press "
+                    "'① Plan it' first.")
+        return self.create_self_duplicate(req, progress_cb=progress_cb)
+
+    def create_self_duplicate(self, changes: str,
+                              progress_cb: Optional[Callable[[str], None]] = None) -> str:
         """Copy the live app into a sandbox and apply requested changes there.
 
         The live app is NOT touched. Returns a review summary; call
         ``promote_pending()`` to apply it for real.
         """
+        prog = progress_cb or (lambda m: None)
         if not getattr(self.brain, "is_online", False):
             return "Connect an AI provider first so I can write the changes."
 
+        # Remember the request so tweak/preview/test know what we're doing.
+        self._pending_request = (changes or self._pending_request or "").strip()
+
+        # Clear any previous sandbox so we start clean.
+        if self._pending_sandbox and os.path.isdir(self._pending_sandbox):
+            shutil.rmtree(self._pending_sandbox, ignore_errors=True)
+
+        prog("Making a safe duplicate of myself…")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sandbox = os.path.join(self.projects_dir, f"_jarvis_sandbox_{stamp}")
         self.log(f"duplicating self -> {sandbox}")
@@ -308,24 +378,53 @@ class ProjectManager:
             return f"Couldn't create the sandbox copy: {exc}"
 
         # Ask the model for a change set against the real source.
+        prog("Writing the code changes…")
         files = self._collect_source(self.app_root)
         relevant = self._pick_relevant(files, changes)
         blob = "\n\n".join(f"=== {rel} ===\n{src}" for rel, src in relevant.items())[:14000]
+        plan_ctx = (f"\n\nAGREED PLAN (follow it):\n{self._pending_plan}"
+                    if self._pending_plan else "")
         prompt = (
             "You are modifying your own source code (JARVIS). Apply the requested "
             "change. Return ONLY a JSON object {\"files\":[{\"path\",\"content\"}], "
             "\"summary\": \"what changed\"} with the FULL new content of each file "
             "you modify (paths relative to the app root). Keep everything else "
             "working; do not break imports.\n\n"
-            f"CHANGE REQUEST: {changes}\n\nRELEVANT SOURCE:\n{blob}"
+            f"CHANGE REQUEST: {changes}{plan_ctx}\n\nRELEVANT SOURCE:\n{blob}"
         )
         manifest = self._parse_manifest(self._gen(prompt))
         if not manifest or not manifest.get("files"):
             shutil.rmtree(sandbox, ignore_errors=True)
             return "I couldn't produce a valid change set for that."
 
-        applied = []
-        for f in manifest["files"]:
+        applied = self._apply_manifest(sandbox, manifest)
+        for rel in applied:
+            prog(f"  changed {rel}")
+
+        # Verify the sandbox compiles.
+        prog("Self-testing the duplicate…")
+        ok, detail = self._compile_check(sandbox, applied)
+        self._pending_sandbox = sandbox
+        self._pending_files = applied
+        self._pending_summary = manifest.get("summary", "") or ", ".join(applied)
+
+        verdict = "compiles cleanly ✓" if ok else f"has a problem: {detail}"
+        msg = (
+            f"I made a safe duplicate and applied the change there (live app "
+            f"untouched).\nChanged: {', '.join(applied)}\nSelf-test: {verdict}\n"
+            f"Summary: {self._pending_summary}\n\n"
+            "Next: press '👁 Preview diff' to see exactly what changed, "
+            "'🧪 Test it' to run a deeper check, or refine with '③ Tweak'. "
+            "When happy, press '✅ Update & Restart'."
+        )
+        if not ok:
+            msg += ("\n\nHeads up: the duplicate didn't compile, so I won't apply "
+                    "it. Try '③ Tweak' with 'fix the error above'.")
+        return msg
+
+    def _apply_manifest(self, sandbox: str, manifest: Dict[str, Any]) -> List[str]:
+        applied: List[str] = []
+        for f in manifest.get("files", []):
             rel = f.get("path", "").lstrip("/\\")
             if not rel or ".." in rel:
                 continue
@@ -334,24 +433,127 @@ class ProjectManager:
             with open(dest, "w", encoding="utf-8") as fh:
                 fh.write(f.get("content", ""))
             applied.append(rel)
+        return applied
 
-        # Verify the sandbox compiles.
-        ok, detail = self._compile_check(sandbox, applied)
-        self._pending_sandbox = sandbox
-        self._pending_summary = manifest.get("summary", "") or ", ".join(applied)
+    # ------------------------------------------------------------------ #
+    def refine_pending(self, feedback: str,
+                       progress_cb: Optional[Callable[[str], None]] = None) -> str:
+        """TWEAK step — apply further changes onto the EXISTING sandbox so the
+        user can iterate/converse toward the result they want before promoting."""
+        prog = progress_cb or (lambda m: None)
+        if not self.has_pending():
+            return ("There's no duplicate to tweak yet. Plan a change and press "
+                    "'② Build & preview' first.")
+        if not getattr(self.brain, "is_online", False):
+            return "Connect an AI provider first so I can write the changes."
+        feedback = (feedback or "").strip()
+        if not feedback:
+            return "Tell me what to tweak about the current duplicate."
 
-        verdict = "compiles cleanly ✓" if ok else f"has a problem: {detail}"
-        msg = (
-            f"I made a safe duplicate and applied the change there (live app "
-            f"untouched).\nChanged: {', '.join(applied)}\nSelf-test: {verdict}\n"
-            f"Summary: {self._pending_summary}\n\n"
-            f"Sandbox: {sandbox}\n"
+        sandbox = self._pending_sandbox
+        prog("Reading the current duplicate…")
+        # Feed the model the CURRENT sandbox source (already-changed files first).
+        sbfiles = self._collect_source(sandbox)
+        focus = self._pending_files + list(sbfiles.keys())
+        seen, ordered = set(), []
+        for rel in focus:
+            if rel in sbfiles and rel not in seen:
+                seen.add(rel)
+                ordered.append(rel)
+            if len(ordered) >= 5:
+                break
+        blob = "\n\n".join(f"=== {rel} ===\n{sbfiles[rel]}" for rel in ordered)[:14000]
+        prompt = (
+            "You are refining an in-progress change to your own source code "
+            "(JARVIS). The code below is the CURRENT work-in-progress. Apply the "
+            "additional tweak. Return ONLY a JSON object {\"files\":"
+            "[{\"path\",\"content\"}], \"summary\": \"what changed\"} with the FULL "
+            "new content of each file you touch. Keep imports working.\n\n"
+            f"ORIGINAL REQUEST: {self._pending_request}\n"
+            f"TWEAK: {feedback}\n\nCURRENT WORK-IN-PROGRESS:\n{blob}"
         )
-        if ok:
-            msg += "Say 'update' / 'apply it' to promote these changes to the live app, or 'discard'."
-        else:
-            msg += "I won't offer to promote this until it compiles. Want me to try fixing it?"
-        return msg
+        prog("Applying the tweak…")
+        manifest = self._parse_manifest(self._gen(prompt))
+        if not manifest or not manifest.get("files"):
+            return "I couldn't turn that tweak into a valid change set."
+        applied = self._apply_manifest(sandbox, manifest)
+        for rel in applied:
+            if rel not in self._pending_files:
+                self._pending_files.append(rel)
+        ok, detail = self._compile_check(sandbox, self._pending_files)
+        if manifest.get("summary"):
+            self._pending_summary = manifest["summary"]
+        verdict = "compiles cleanly ✓" if ok else f"has a problem: {detail}"
+        return (f"Tweaked the duplicate.\nChanged now: {', '.join(applied)}\n"
+                f"Self-test: {verdict}\n\n"
+                "Preview it, test it, tweak again, or '✅ Update & Restart'.")
+
+    def preview_pending(self) -> str:
+        """Return a readable unified diff of the pending change vs the live app."""
+        if not self.has_pending():
+            return "There's no pending change to preview."
+        import difflib
+        sandbox = self._pending_sandbox
+        chunks: List[str] = []
+        for rel in self._pending_files:
+            new_path = os.path.join(sandbox, rel)
+            old_path = os.path.join(self.app_root, rel)
+            try:
+                with open(new_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    new = fh.read().splitlines()
+            except Exception:
+                continue
+            old: List[str] = []
+            if os.path.exists(old_path):
+                try:
+                    with open(old_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        old = fh.read().splitlines()
+                except Exception:
+                    old = []
+            label = rel + ("  (NEW FILE)" if not old else "")
+            diff = list(difflib.unified_diff(
+                old, new, fromfile=f"live/{rel}", tofile=f"new/{rel}",
+                lineterm="", n=2))
+            if not diff:
+                chunks.append(f"### {label}\n(no textual change)")
+                continue
+            # Trim very large diffs so the panel stays readable.
+            if len(diff) > 220:
+                diff = diff[:220] + [f"... (+{len(diff) - 220} more lines)"]
+            chunks.append(f"### {label}\n" + "\n".join(diff))
+        if not chunks:
+            return "No differences found in the pending change."
+        return f"PREVIEW — {len(self._pending_files)} file(s) changed:\n\n" + \
+               "\n\n".join(chunks)
+
+    def test_pending(self) -> str:
+        """TEST step — deeper check of the duplicate: byte-compile every Python
+        file in the sandbox in a separate process (catches syntax/indentation
+        errors across the whole app, not just changed files)."""
+        if not self.has_pending():
+            return "There's no pending change to test."
+        sandbox = self._pending_sandbox
+        # 1) Fast AST check on changed files (precise line numbers).
+        ok, detail = self._compile_check(sandbox, self._pending_files)
+        if not ok:
+            return f"❌ Test failed on a changed file — {detail}\nFix with '③ Tweak'."
+        # 2) Whole-app byte-compile in a subprocess (isolated, safe).
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "compileall", "-q", sandbox],
+                capture_output=True, text=True, timeout=90,
+            )
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            if proc.returncode == 0:
+                return ("✅ Test passed — every Python file in the duplicate "
+                        "compiles cleanly. Safe to Update & Restart.\n"
+                        + (f"\n{out[-1500:]}" if out else ""))
+            return ("❌ Test found a problem while compiling the duplicate:\n"
+                    f"{out[-2000:] or '(no detail)'}\nFix with '③ Tweak'.")
+        except subprocess.TimeoutExpired:
+            return "Test timed out compiling the duplicate."
+        except Exception as exc:
+            return f"Couldn't run the test: {exc}"
 
     def promote_pending(self) -> str:
         """Apply the pending sandbox's changed files onto the live app (backed up)."""
@@ -395,20 +597,42 @@ class ProjectManager:
                 except Exception as exc:
                     self.log(f"promote failed {rel}: {exc}")
 
+        # Record this backup as the "last known-good / safe version" so the
+        # crash-recovery SafeBoot can roll back to it if the new code won't boot.
+        try:
+            self._write_last_safe(backup)
+        except Exception as exc:
+            self.log(f"could not write last_safe pointer: {exc}")
+
         self._pending_sandbox = None
         summary = self._pending_summary
         self._pending_summary = ""
+        self._pending_files = []
+        self._pending_request = ""
+        self._pending_plan = ""
         if not promoted:
             return "Nothing to promote — the sandbox matched the live app."
         return (f"Applied {len(promoted)} file(s) to the live app: "
                 f"{', '.join(promoted)}.\nBackup saved at {backup}\n"
-                f"Restart Jarvis (or press ⟳) to load the new code. ({summary})")
+                f"Restart Jarvis to load the new code. If the new version ever "
+                f"fails to start, Jarvis will automatically roll back to this "
+                f"safe version. ({summary})")
+
+    def _write_last_safe(self, backup_dir: str) -> None:
+        """Save a pointer to the most recent good backup for crash recovery."""
+        cfg_dir = os.path.join(self.app_root, "config")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "last_safe.json"), "w", encoding="utf-8") as fh:
+            json.dump({"backup": backup_dir, "time": datetime.now().isoformat()}, fh, indent=2)
 
     def discard_pending(self) -> str:
         if self._pending_sandbox and os.path.isdir(self._pending_sandbox):
             shutil.rmtree(self._pending_sandbox, ignore_errors=True)
         self._pending_sandbox = None
         self._pending_summary = ""
+        self._pending_files = []
+        self._pending_request = ""
+        self._pending_plan = ""
         return "Discarded the pending changes. Live app is unchanged."
 
     def has_pending(self) -> bool:

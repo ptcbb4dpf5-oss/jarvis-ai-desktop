@@ -175,40 +175,79 @@ class ProjectsPanel(QDialog):
         lay.setSpacing(8)
 
         blurb = QLabel(
-            "Jarvis can read and improve his OWN code. He builds a safe copy, "
-            "makes the change there, tests it, and only touches the real app "
-            "when you press <b>Update</b>. A backup is always made first.")
+            "This is how Jarvis upgrades <b>himself</b>. Tell him what you want "
+            "changed, he plans it, builds it in a safe copy, you preview & test "
+            "it, and only when you're happy does he apply it and restart. If a "
+            "new version ever fails to start, Jarvis rolls back to the last safe "
+            "version automatically.")
         blurb.setStyleSheet("color:#8fbfcf; font-size:11px;")
         blurb.setWordWrap(True)
         lay.addWidget(blurb)
 
+        # Recommendation banner (connect more AIs / agents).
+        self.reco_banner = QLabel("")
+        self.reco_banner.setStyleSheet(
+            f"color:{AMBER}; font-size:11px; background:rgba(255,184,77,18); "
+            f"border:1px solid rgba(255,184,77,90); border-radius:6px; padding:8px 10px;")
+        self.reco_banner.setWordWrap(True)
+        self.reco_banner.setOpenExternalLinks(False)
+        lay.addWidget(self.reco_banner)
+
         self.selfdev_out = QTextEdit()
         self.selfdev_out.setReadOnly(True)
         self.selfdev_out.setPlaceholderText(
-            "Ask Jarvis to understand himself or to improve himself…")
+            "Tell Jarvis what to change about himself, then follow the steps "
+            "below: ① Plan → ② Build & preview → ③ Tweak (optional) → Test → "
+            "Update & Restart.")
         lay.addWidget(self.selfdev_out, 1)
 
-        # Change request box.
-        crow = QHBoxLayout()
+        # --- Change request box --------------------------------------- #
         self.change_box = QLineEdit()
         self.change_box.setPlaceholderText(
-            "Describe an improvement to Jarvis  (e.g. \"make the orb pulse faster when thinking\")")
-        crow.addWidget(self.change_box, 1)
-        lay.addLayout(crow)
+            "What do you want to change about Jarvis?  "
+            "(e.g. \"make the orb pulse faster when thinking\")")
+        lay.addWidget(self.change_box)
 
-        row = QHBoxLayout()
+        # --- Step 1: plan / understand -------------------------------- #
+        row1 = QHBoxLayout()
+        self.plan_btn = QPushButton("①  Plan it")
+        self.plan_btn.setObjectName("go")
+        self.plan_btn.clicked.connect(self._plan)
         self.read_btn = QPushButton("🔍  Understand my code")
         self.read_btn.clicked.connect(self._read_own)
-        self.dup_btn = QPushButton("⚙  Build improved duplicate")
-        self.dup_btn.setObjectName("go")
-        self.dup_btn.clicked.connect(self._make_duplicate)
-        row.addWidget(self.read_btn)
-        row.addWidget(self.dup_btn)
-        lay.addLayout(row)
+        row1.addWidget(self.plan_btn)
+        row1.addWidget(self.read_btn)
+        lay.addLayout(row1)
 
-        # Pending review actions.
+        # --- Step 2: build & preview ---------------------------------- #
+        row2 = QHBoxLayout()
+        self.build_btn = QPushButton("②  Build & preview")
+        self.build_btn.setObjectName("go")
+        self.build_btn.clicked.connect(self._build)
+        self.preview_btn = QPushButton("👁  Preview changes")
+        self.preview_btn.clicked.connect(self._preview)
+        self.test_btn = QPushButton("🧪  Test it")
+        self.test_btn.clicked.connect(self._test)
+        row2.addWidget(self.build_btn)
+        row2.addWidget(self.preview_btn)
+        row2.addWidget(self.test_btn)
+        lay.addLayout(row2)
+
+        # --- Step 3: tweak (converse for more changes) ---------------- #
+        self.tweak_box = QLineEdit()
+        self.tweak_box.setPlaceholderText(
+            "Not quite right? Describe a tweak and press ③ Tweak  "
+            "(e.g. \"also make it brighter\")")
+        lay.addWidget(self.tweak_box)
+        row3 = QHBoxLayout()
+        self.tweak_btn = QPushButton("③  Tweak the preview")
+        self.tweak_btn.clicked.connect(self._tweak)
+        row3.addWidget(self.tweak_btn)
+        lay.addLayout(row3)
+
+        # --- Final: apply + restart / discard ------------------------- #
         prow = QHBoxLayout()
-        self.update_btn = QPushButton("✅  Update (apply to live app)")
+        self.update_btn = QPushButton("✅  Update & Restart Jarvis")
         self.update_btn.setObjectName("update")
         self.update_btn.clicked.connect(self._promote)
         self.discard_btn = QPushButton("🗑  Discard")
@@ -220,13 +259,15 @@ class ProjectsPanel(QDialog):
 
         self.tabs.addTab(page, "Self-Development")
         self._refresh_pending_buttons()
+        self._refresh_reco()
 
     # ================================================================== #
     # Helpers
     # ================================================================== #
     def _busy(self, on: bool, msg: str = "") -> None:
         for b in (getattr(self, n, None) for n in (
-                "run_btn", "iterate_btn", "read_btn", "dup_btn",
+                "run_btn", "iterate_btn", "read_btn", "plan_btn", "build_btn",
+                "preview_btn", "test_btn", "tweak_btn",
                 "update_btn", "discard_btn")):
             if b is not None:
                 b.setEnabled(not on)
@@ -270,10 +311,39 @@ class ProjectsPanel(QDialog):
             pending = self.pm.has_pending()
         except Exception:
             pending = False
-        self.update_btn.setEnabled(pending)
-        self.discard_btn.setEnabled(pending)
-        if pending:
-            self.update_btn.setText("✅  Update (apply the reviewed change)")
+        # Preview/test/tweak/apply only make sense once a preview is built.
+        for b in (getattr(self, n, None) for n in (
+                "preview_btn", "test_btn", "tweak_btn", "update_btn", "discard_btn")):
+            if b is not None:
+                b.setEnabled(pending)
+
+    def _refresh_reco(self) -> None:
+        """Nudge the user to connect more AIs/agents so Jarvis gets smarter."""
+        n = 0
+        try:
+            from core import providers as _pv
+            llm = self.pm.brain.config.get("llm", {}) if hasattr(self.pm, "brain") else {}
+            n = len(_pv.connected_providers(llm)) + len(_pv.connected_agents(llm))
+        except Exception:
+            n = 0
+        if n == 0:
+            self.reco_banner.setText(
+                "💡  <b>Make Jarvis smarter:</b> no AI brains are connected yet. "
+                "Open <b>Settings → AI Providers / Agents</b> and connect at least one "
+                "(Groq, Google and Mistral are free) so Jarvis can plan and write "
+                "his own upgrades.")
+            self.reco_banner.setVisible(True)
+        elif n < 2:
+            self.reco_banner.setText(
+                "💡  <b>Tip:</b> you have 1 AI brain connected. Connecting more "
+                "AIs & coding agents (Settings → AI Providers / Agents) lets Jarvis "
+                "cross-check ideas and handle harder self-upgrades and tasks.")
+            self.reco_banner.setVisible(True)
+        else:
+            self.reco_banner.setText(
+                f"🧠  {n} AI brains/agents connected. Add more anytime in "
+                "Settings → AI Providers / Agents to boost what Jarvis can do.")
+            self.reco_banner.setVisible(True)
 
     # ================================================================== #
     # Project actions
@@ -352,28 +422,92 @@ class ProjectsPanel(QDialog):
         self._run_bg(lambda: self.pm.read_own_code(q), self.selfdev_out,
                      "Reading my own code…")
 
-    def _make_duplicate(self) -> None:
+    def _plan(self) -> None:
         change = self.change_box.text().strip()
         if not change:
             QMessageBox.information(
                 self, "Describe the change",
-                "Type what you'd like me to improve about myself first.")
+                "First, type what you'd like me to improve about myself.")
             return
-        self._run_bg(lambda: self.pm.create_self_duplicate(change), self.selfdev_out,
-                     "Building a safe duplicate and applying the change…")
+        self.selfdev_out.append(
+            "\n──────── ①  PLANNING ────────\n"
+            "Jarvis is working out the best way to do this…")
+        self._run_bg(lambda: self.pm.plan_change(change), self.selfdev_out,
+                     "Planning the change…")
+
+    def _build(self) -> None:
+        change = self.change_box.text().strip()
+        if not change:
+            QMessageBox.information(
+                self, "Describe the change",
+                "Type what you'd like me to improve about myself first "
+                "(and ideally press ① Plan it before building).")
+            return
+        self.selfdev_out.append(
+            "\n──────── ②  BUILD & PREVIEW ────────\n"
+            "Building a safe copy and applying the change there…")
+        self._run_bg(lambda prog: self.pm.build_pending(prog), self.selfdev_out,
+                     "Building the preview (safe copy)…")
+
+    def _preview(self) -> None:
+        self.selfdev_out.append("\n──────── 👁  PREVIEW OF CHANGES ────────")
+        self._run_bg(lambda: self.pm.preview_pending(), self.selfdev_out,
+                     "Gathering the preview…")
+
+    def _test(self) -> None:
+        self.selfdev_out.append("\n──────── 🧪  TESTING ────────")
+        self._run_bg(lambda: self.pm.test_pending(), self.selfdev_out,
+                     "Testing the preview…")
+
+    def _tweak(self) -> None:
+        feedback = self.tweak_box.text().strip()
+        if not feedback:
+            QMessageBox.information(
+                self, "Describe the tweak",
+                "Type what else you'd like changed in the preview.")
+            return
+        if not self.pm.has_pending():
+            QMessageBox.information(
+                self, "Nothing to tweak yet",
+                "Press ② Build & preview first, then you can tweak it.")
+            return
+        self.selfdev_out.append(f"\n──────── ③  TWEAK ────────\nApplying: {feedback}")
+        self.tweak_box.clear()
+        self._run_bg(lambda prog: self.pm.refine_pending(feedback, prog),
+                     self.selfdev_out, "Applying your tweak to the preview…")
 
     def _promote(self) -> None:
         box = QMessageBox(self)
-        box.setWindowTitle("Apply to live app?")
-        box.setText("Apply the reviewed change to the REAL Jarvis?\n\n"
-                    "A full backup is made first, and you can restart to load it.")
+        box.setWindowTitle("Update & Restart Jarvis?")
+        box.setText(
+            "Apply the reviewed change to the REAL Jarvis and restart?\n\n"
+            "• A full backup is made first (saved as the last safe version).\n"
+            "• Jarvis will close and reopen to load the new code.\n"
+            "• If the new version won't start, Jarvis auto-rolls back.")
         box.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.No)
         if box.exec() != QMessageBox.StandardButton.Yes:
             return
-        self._run_bg(lambda: self.pm.promote_pending(), self.selfdev_out,
-                     "Applying to the live app (with backup)…")
+        # Apply on the UI thread (fast, file copies) then restart.
+        try:
+            result = self.pm.promote_pending()
+        except Exception as exc:
+            self.selfdev_out.append(f"\nUpdate failed: {exc}")
+            return
+        self.selfdev_out.append(f"\n{result}")
+        self._refresh_pending_buttons()
+        # Ask the main window to restart so the new code loads.
+        parent = self.parent()
+        restart = getattr(parent, "_restart_for_update", None)
+        if callable(restart):
+            self.status.setText("Restarting Jarvis to load your new version…")
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1200, restart)
+        else:
+            QMessageBox.information(
+                self, "Restart needed",
+                "Update applied. Please restart Jarvis to load the new version.")
 
     def _discard(self) -> None:
         self._run_bg(lambda: self.pm.discard_pending(), self.selfdev_out,

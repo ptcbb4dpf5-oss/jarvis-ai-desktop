@@ -53,7 +53,7 @@ from modules.input_control import InputControl
 from modules.app_manager import AppManager
 from modules.browser import Browser
 from modules.self_modify import SelfModifier
-from core.updater import Updater
+from core.updater import Updater, SafeBoot
 from core.reasoning import ReasoningEngine
 from core.projects import ProjectManager
 from ui.settings_dialog import SettingsDialog
@@ -319,7 +319,15 @@ class JarvisWindow(QWidget):
             " padding: 8px; }"
         )
 
-        # Status line.
+        # Connection line (ONLINE / OFFLINE) — sits ABOVE the status line so the
+        # user always sees at a glance whether an AI brain is connected.
+        self.conn_label = QLabel("◌ OFFLINE", self)
+        self.conn_label.setStyleSheet(
+            "color:#5f7f8f; font-family:Consolas,monospace; font-size:11px;"
+            " font-weight:bold; background:transparent;"
+        )
+
+        # Status line (IDLE / LISTENING / THINKING …).
         self.status_label = QLabel("● IDLE", self)
         self.status_label.setStyleSheet(
             "color:#00e5ff; font-family:Consolas,monospace; font-size:11px; background:transparent;"
@@ -420,9 +428,11 @@ class JarvisWindow(QWidget):
         self.mic_btn.setGeometry(row_x + row_w - 84, h - 56, 38, 38)
         self.update_btn.setGeometry(row_x + row_w - 42, h - 56, 38, 38)
 
-        self.status_label.setGeometry(20, 16, 200, 20)
+        # Top-left stack:  [◉ ONLINE] over [● STATUS] over [system tray].
+        self.conn_label.setGeometry(20, 14, 220, 18)
+        self.status_label.setGeometry(20, 34, 220, 18)
         # System tray (fixed-size gauge panel) sits under the status line, top-left.
-        self.sys_tray.move(20, 44)
+        self.sys_tray.move(20, 58)
         # Top-right buttons: [🛠 projects] [⚙ settings]
         self.settings_btn.setGeometry(w - 52, 14, 38, 38)
         self.projects_btn.setGeometry(w - 98, 14, 38, 38)
@@ -465,7 +475,27 @@ class JarvisWindow(QWidget):
         # Populate the tray immediately so it isn't blank on launch.
         QTimer.singleShot(250, self._refresh_hud)
 
+    def _refresh_conn(self) -> None:
+        """Reflect whether an AI brain is connected (ONLINE) or not (OFFLINE)."""
+        try:
+            online = bool(getattr(self.brain, "is_online", False))
+        except Exception:
+            online = False
+        if online:
+            label = getattr(self.brain, "last_provider", None)
+            txt = "◉ ONLINE" + (f" · {label}" if label else "")
+            self.conn_label.setText(txt)
+            self.conn_label.setStyleSheet(
+                "color:#38e08f; font-family:Consolas,monospace; font-size:11px;"
+                " font-weight:bold; background:transparent;")
+        else:
+            self.conn_label.setText("◌ OFFLINE")
+            self.conn_label.setStyleSheet(
+                "color:#ff9070; font-family:Consolas,monospace; font-size:11px;"
+                " font-weight:bold; background:transparent;")
+
     def _refresh_hud(self) -> None:
+        self._refresh_conn()
         try:
             snap = self.system_monitor.snapshot()
         except Exception:
@@ -836,11 +866,35 @@ def _configure_dpi() -> None:
 
 def main() -> int:
     _configure_dpi()
+
+    # --- Crash recovery ------------------------------------------------- #
+    # If the previous launch left a "boot in progress" flag (i.e. it crashed
+    # on startup — usually right after a bad self-update), roll back to the
+    # last safe version BEFORE we try to build the UI again.
+    sb = SafeBoot(APP_DIR)
+    recovery_note = ""
+    try:
+        if sb.needs_recovery():
+            result = sb.recover()
+            recovery_note = result.get("message", "")
+            print(recovery_note)
+    except Exception as exc:
+        print(f"SafeBoot recovery skipped: {exc}")
+    # Drop a fresh flag; it gets cleared a few seconds after a successful boot.
+    sb.mark_boot_start()
+
     config = load_config()
     app = QApplication(sys.argv)
     app.setApplicationName("JARVIS")
     win = JarvisWindow(config)
     win.show()
+    # Surviving 8 seconds after the window appears counts as a healthy boot.
+    QTimer.singleShot(8000, sb.mark_boot_ok)
+    if recovery_note:
+        try:
+            QTimer.singleShot(1200, lambda: win._log(recovery_note))
+        except Exception:
+            pass
     return app.exec()
 
 

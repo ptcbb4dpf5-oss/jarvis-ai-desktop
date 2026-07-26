@@ -18,13 +18,33 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
     QLabel, QPushButton, QScrollArea, QFrame, QCheckBox, QComboBox,
 )
+
+
+class _VoiceTestWorker(QThread):
+    """Validate + play an ElevenLabs sample off the UI thread."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, api_key: str, voice_id: str, parent=None):
+        super().__init__(parent)
+        self._key = api_key
+        self._voice = voice_id
+
+    def run(self) -> None:
+        try:
+            from ui.voice_handler import eleven_speak
+            ok, msg = eleven_speak(
+                self._key, self._voice,
+                "All systems are online, sir. This is the voice you selected.")
+        except Exception as exc:  # noqa: BLE001
+            ok, msg = False, f"Test failed: {exc}"
+        self.done.emit(ok, msg)
 
 from core import providers as P
 
@@ -233,32 +253,20 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(area, "Agents")
 
     def _build_voice_tab(self) -> None:
+        from ui.voice_handler import JARVIS_VOICES, DEFAULT_JARVIS_VOICE_ID
         area, v = self._scroll_body()
         vcfg = self._config.setdefault("voice", {})
         ecfg = vcfg.setdefault("elevenlabs", {})
 
         intro = QLabel("Pick how Jarvis sounds. <b>System voice</b> works "
-                       "offline out of the box. <b>ElevenLabs</b> gives the "
-                       "real cinematic Iron-Man &ldquo;JARVIS&rdquo; voice "
-                       "(needs a free key + internet).")
+                       "offline out of the box. The <b>JARVIS voices</b> are "
+                       "cinematic Iron-Man style voices from ElevenLabs — paste "
+                       "a free key below, pick a voice, and press <b>Test</b>.")
         intro.setStyleSheet("color:#8fbfcf; font-size:11px;")
         intro.setWordWrap(True)
         v.addWidget(intro)
 
-        # --- Engine selector ---
-        eng_row = QHBoxLayout()
-        eng_row.addWidget(QLabel("Voice engine:"))
-        self.voice_engine = QComboBox()
-        self.voice_engine.addItem("System voice (offline)", "pyttsx3")
-        self.voice_engine.addItem("ElevenLabs — JARVIS voice", "elevenlabs")
-        cur_eng = (vcfg.get("engine", "pyttsx3") or "pyttsx3").lower()
-        idx = self.voice_engine.findData(cur_eng)
-        if idx >= 0:
-            self.voice_engine.setCurrentIndex(idx)
-        eng_row.addWidget(self.voice_engine, 1)
-        v.addLayout(eng_row)
-
-        # --- ElevenLabs card ---
+        # --- ElevenLabs API key card ---
         card = QFrame()
         card.setStyleSheet(
             "QFrame { background: rgba(0,229,255,10); border:1px solid rgba(0,229,255,70);"
@@ -268,7 +276,7 @@ class SettingsDialog(QDialog):
         cl.setSpacing(6)
 
         head = QHBoxLayout()
-        nm = QLabel("ElevenLabs")
+        nm = QLabel("ElevenLabs key")
         nm.setStyleSheet(f"color:{CYAN}; font-size:15px; font-weight:bold;")
         head.addWidget(nm)
         badge = QLabel("FREE TIER")
@@ -284,9 +292,8 @@ class SettingsDialog(QDialog):
         head.addWidget(get)
         cl.addLayout(head)
 
-        blurb = QLabel("Paste your ElevenLabs API key to unlock the real JARVIS "
-                       "voice. The default voice id is a refined British male — "
-                       "change it to any voice id from your ElevenLabs library.")
+        blurb = QLabel("Only needed for the JARVIS voices below. The System "
+                       "voice needs no key.")
         blurb.setStyleSheet("color:#8fbfcf; font-size:10px;")
         blurb.setWordWrap(True)
         cl.addWidget(blurb)
@@ -304,17 +311,39 @@ class SettingsDialog(QDialog):
             lambda t: self._set_dot(self.eleven_dot, bool(t.strip())))
         krow.addWidget(self.eleven_dot)
         cl.addLayout(krow)
-
-        vid_row = QHBoxLayout()
-        vid_row.addWidget(QLabel("Voice id:"))
-        from ui.voice_handler import DEFAULT_JARVIS_VOICE_ID
-        self.eleven_voice = QLineEdit(ecfg.get("voice_id", "") or DEFAULT_JARVIS_VOICE_ID)
-        self.eleven_voice.setPlaceholderText(DEFAULT_JARVIS_VOICE_ID)
-        vid_row.addWidget(self.eleven_voice, 1)
-        cl.addLayout(vid_row)
         v.addWidget(card)
 
-        # --- Rate / volume sliders (apply to system voice) ---
+        # --- Voice picker (system + preloaded JARVIS voices) ---
+        vr = QHBoxLayout()
+        vr.addWidget(QLabel("Jarvis voice:"))
+        self.voice_pick = QComboBox()
+        self.voice_pick.addItem("System voice (offline, no key)", "system")
+        for spec in JARVIS_VOICES:
+            self.voice_pick.addItem(f"JARVIS · {spec['label']}", spec["id"])
+        # Restore current selection.
+        cur_engine = (vcfg.get("engine", "pyttsx3") or "pyttsx3").lower()
+        cur_voice = ecfg.get("voice_id", "") or DEFAULT_JARVIS_VOICE_ID
+        if cur_engine == "elevenlabs":
+            idx = self.voice_pick.findData(cur_voice)
+            self.voice_pick.setCurrentIndex(idx if idx >= 0 else 1)
+        else:
+            self.voice_pick.setCurrentIndex(0)
+        vr.addWidget(self.voice_pick, 1)
+        v.addLayout(vr)
+
+        # --- Test button + status ---
+        trow = QHBoxLayout()
+        self.voice_test_btn = QPushButton("🔊  Test voice")
+        self.voice_test_btn.clicked.connect(self._on_test_voice)
+        trow.addWidget(self.voice_test_btn)
+        self.voice_test_status = QLabel("")
+        self.voice_test_status.setStyleSheet("color:#8fbfcf; font-size:11px;")
+        self.voice_test_status.setWordWrap(True)
+        trow.addWidget(self.voice_test_status, 1)
+        v.addLayout(trow)
+        self._voice_test_worker = None
+
+        # --- Rate (applies to system voice) ---
         self.voice_rate = QLineEdit(str(vcfg.get("rate", 178)))
         self.voice_rate.setPlaceholderText("178")
         rr = QHBoxLayout()
@@ -328,6 +357,33 @@ class SettingsDialog(QDialog):
 
         v.addStretch(1)
         self.tabs.addTab(area, "Voice")
+
+    # ------------------------------------------------------------------ #
+    def _on_test_voice(self) -> None:
+        data = self.voice_pick.currentData()
+        if data == "system":
+            self.voice_test_status.setText(
+                "System voice uses your Windows/OS voice — no key or internet "
+                "needed. Save to hear it on the next reply.")
+            return
+        key = self.eleven_key.text().strip()
+        if not key:
+            self.voice_test_status.setText(
+                "Paste your ElevenLabs API key first, then Test.")
+            return
+        if self._voice_test_worker and self._voice_test_worker.isRunning():
+            return
+        self.voice_test_btn.setEnabled(False)
+        self.voice_test_status.setText("Testing… synthesising a sample.")
+        self._voice_test_worker = _VoiceTestWorker(key, data, self)
+        self._voice_test_worker.done.connect(self._on_test_done)
+        self._voice_test_worker.start()
+
+    def _on_test_done(self, ok: bool, msg: str) -> None:
+        self.voice_test_btn.setEnabled(True)
+        color = GREEN if ok else "#ff8080"
+        self.voice_test_status.setStyleSheet(f"color:{color}; font-size:11px;")
+        self.voice_test_status.setText(("✓ " if ok else "✗ ") + msg)
 
     def _set_dot(self, dot: QLabel, connected: bool) -> None:
         if connected:
@@ -377,14 +433,20 @@ class SettingsDialog(QDialog):
         vcfg = self._config.setdefault("voice", {})
         vcfg["enabled"] = self.voice_enabled.isChecked()
         vcfg["speak_responses"] = self.voice_speak.isChecked()
-        vcfg["engine"] = self.voice_engine.currentData()
         try:
             vcfg["rate"] = int(self.voice_rate.text().strip() or 178)
         except Exception:
             vcfg["rate"] = 178
         ecfg = vcfg.setdefault("elevenlabs", {})
         ecfg["api_key"] = self.eleven_key.text().strip()
-        ecfg["voice_id"] = self.eleven_voice.text().strip()
+        # The single voice picker drives BOTH the engine and the voice id, so a
+        # non-technical user never has to think about "engines" or "voice ids".
+        pick = self.voice_pick.currentData()
+        if pick and pick != "system":
+            vcfg["engine"] = "elevenlabs"
+            ecfg["voice_id"] = pick
+        else:
+            vcfg["engine"] = "pyttsx3"
         ecfg.setdefault("model", "eleven_turbo_v2_5")
         ucfg = self._config.setdefault("ui", {})
         ucfg["start_fullscreen"] = self.start_fullscreen.isChecked()
