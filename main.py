@@ -40,7 +40,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLineEdit, QLabel, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QSizePolicy,
+    QPushButton, QTextEdit, QSizePolicy, QMessageBox,
 )
 
 from core.brain import Brain
@@ -53,6 +53,7 @@ from modules.input_control import InputControl
 from modules.app_manager import AppManager
 from modules.browser import Browser
 from modules.self_modify import SelfModifier
+from core.updater import Updater
 
 from ui.orb_widget import OrbWidget
 from ui.hud_panel import HudPanel
@@ -164,6 +165,22 @@ class AgentWorker(QThread):
     def _is_exit(text: str, reply: str) -> bool:
         t = (text or "").lower()
         return any(w in t for w in ("exit jarvis", "quit jarvis", "shut down jarvis", "goodbye jarvis"))
+
+
+# --------------------------------------------------------------------------- #
+class UpdateWorker(QThread):
+    """Runs a self-update in the background so the UI never freezes."""
+    finished_update = pyqtSignal(bool, bool, str)  # ok, changed, message
+    log_line = pyqtSignal(str)
+
+    def run(self) -> None:
+        updater = Updater(log=self.log_line.emit)
+        result = updater.update()
+        self.finished_update.emit(
+            bool(result.get("ok")),
+            bool(result.get("changed")),
+            str(result.get("message", "")),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -302,8 +319,18 @@ class JarvisWindow(QWidget):
         self.mic_btn.setStyleSheet(self.send_btn.styleSheet())
         self.mic_btn.clicked.connect(self._toggle_listening)
 
+        # Update button — pulls the latest code from GitHub and reloads.
+        self.update_btn = QPushButton("⟳", self)
+        self.update_btn.setFixedSize(38, 38)
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setToolTip("Update Jarvis to the latest version")
+        self.update_btn.setStyleSheet(self.send_btn.styleSheet())
+        self.update_btn.clicked.connect(self._on_update)
+        self._update_worker: Optional[UpdateWorker] = None
+
         # Shortcuts.
         QShortcut(QKeySequence("Ctrl+Space"), self, activated=self._toggle_listening)
+        QShortcut(QKeySequence("Ctrl+U"), self, activated=self._on_update)
         QShortcut(QKeySequence("Ctrl+H"), self, activated=self._toggle_hud)
         QShortcut(QKeySequence("Escape"), self, activated=self._on_escape)
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
@@ -325,12 +352,13 @@ class JarvisWindow(QWidget):
         t_h = 120
         self.transcript.setGeometry(int((w - t_w) / 2), h - t_h - 78, t_w, t_h)
 
-        # Input row at bottom.
+        # Input row at bottom.  [ input .......... ] [▶] [🎙] [⟳]
         row_w = int(w * 0.5)
         row_x = int((w - row_w) / 2)
-        self.input_box.setGeometry(row_x, h - 56, row_w - 88, 38)
-        self.send_btn.setGeometry(row_x + row_w - 84, h - 56, 38, 38)
-        self.mic_btn.setGeometry(row_x + row_w - 42, h - 56, 38, 38)
+        self.input_box.setGeometry(row_x, h - 56, row_w - 130, 38)
+        self.send_btn.setGeometry(row_x + row_w - 126, h - 56, 38, 38)
+        self.mic_btn.setGeometry(row_x + row_w - 84, h - 56, 38, 38)
+        self.update_btn.setGeometry(row_x + row_w - 42, h - 56, 38, 38)
 
         self.status_label.setGeometry(20, 16, 200, 20)
 
@@ -540,6 +568,59 @@ class JarvisWindow(QWidget):
         elif self.hud_left.is_shown:
             self._toggle_hud()
 
+    # ================================================================== #
+    # Self-update
+    # ================================================================== #
+    def _on_update(self) -> None:
+        if self._update_worker and self._update_worker.isRunning():
+            return
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("…")
+        self._set_orb_state(STATE_WORKING)
+        self._append_transcript("JARVIS", "Checking for updates…")
+        if self.config["voice"]["speak_responses"] and self.speaker:
+            self.speaker.say("Checking for updates.")
+
+        self._update_worker = UpdateWorker()
+        self._update_worker.log_line.connect(self._log)
+        self._update_worker.finished_update.connect(self._on_update_done)
+        self._update_worker.start()
+
+    def _on_update_done(self, ok: bool, changed: bool, message: str) -> None:
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("⟳")
+        self._set_orb_state(STATE_IDLE)
+        self._append_transcript("JARVIS", message)
+        if self.config["voice"]["speak_responses"] and self.speaker:
+            self.speaker.say(message)
+
+        if ok and changed:
+            box = QMessageBox(self)
+            box.setWindowTitle("Jarvis Update")
+            box.setText(message + "\n\nRestart now to load the update?")
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.Yes)
+            box.setStyleSheet(
+                "QMessageBox { background:#0a1017; }"
+                "QLabel { color:#c8f6ff; font-family:Consolas; }"
+                "QPushButton { background: rgba(0,229,255,30); color:#00e5ff;"
+                " border:1px solid #00e5ff; border-radius:6px; padding:6px 16px; }"
+                "QPushButton:hover { background: rgba(0,229,255,70); }"
+            )
+            if box.exec() == QMessageBox.StandardButton.Yes:
+                self._restart_for_update()
+
+    def _restart_for_update(self) -> None:
+        """Cleanly stop threads then relaunch the process to load new code."""
+        try:
+            self._shutdown_threads()
+        except Exception:
+            pass
+        QApplication.quit()
+        Updater.restart()
+
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showNormal()
@@ -547,7 +628,8 @@ class JarvisWindow(QWidget):
             self.showFullScreen()
 
     # ================================================================== #
-    def closeEvent(self, event):  # noqa: N802
+    def _shutdown_threads(self) -> None:
+        """Stop every background thread/module. Shared by close + restart."""
         try:
             if self.listener:
                 self.listener.stop()
@@ -566,6 +648,11 @@ class JarvisWindow(QWidget):
         except Exception:
             pass
         try:
+            if self._update_worker:
+                self._update_worker.wait(2000)
+        except Exception:
+            pass
+        try:
             self.self_modifier.shutdown()
         except Exception:
             pass
@@ -573,6 +660,9 @@ class JarvisWindow(QWidget):
             self.browser.close()
         except Exception:
             pass
+
+    def closeEvent(self, event):  # noqa: N802
+        self._shutdown_threads()
         super().closeEvent(event)
 
 

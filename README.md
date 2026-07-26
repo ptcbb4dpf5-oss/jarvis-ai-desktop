@@ -42,8 +42,31 @@ on the fly.
 
 ## 🚀 Quick Start
 
+### Option A — One-click installer (easiest, no git clone)
+
+You don't have to clone anything. Just grab the installer and double-click it —
+it downloads Jarvis from GitHub, lets you **pick any folder**, installs all
+dependencies, and adds a **desktop shortcut**.
+
+* **`Jarvis-Installer.bat`** — double-click it. If Python is present it opens a
+  graphical installer with a folder picker; if not, it points you to the Python
+  download first.
+* **Want a real `.exe`?** Run **`build_installer.bat`** once on any Windows PC —
+  it compiles `installer.py` into **`dist\JarvisInstaller.exe`**, a single
+  double-clickable file you can keep or share. Running that `.exe` installs
+  Jarvis to whatever location you choose.
+
+Then set your API key and launch:
+
 ```bat
-:: 1. Clone / copy this folder, then run the installer:
+setx OPENAI_API_KEY "sk-your-key-here"
+run.bat
+```
+
+### Option B — Manual setup (from a cloned/downloaded folder)
+
+```bat
+:: 1. From inside the jarvis folder:
 setup.bat
 
 :: 2. Set your API key (recommended: environment variable)
@@ -58,6 +81,20 @@ run.bat
 
 > **PyAudio trouble?** If `pip` can’t build PyAudio, run:
 > `python -m pip install pipwin && pipwin install pyaudio`
+
+---
+
+## 🔄 Updating Jarvis
+
+Jarvis updates itself — no re-downloading needed.
+
+* Press the **⟳ Update button** in the bottom-right of the UI (or **Ctrl+U**).
+* Jarvis pulls the latest code from GitHub, keeps your settings and plugins
+  intact, and offers to restart to load the new version.
+* Under the hood it uses `git pull` when available, otherwise downloads the
+  latest ZIP from GitHub (`core/updater.py`). Your `config/settings.json` and
+  `plugins/` are always preserved, and the previous code is backed up to a
+  timestamped `.backup_*` folder in case you want to roll back.
 
 ---
 
