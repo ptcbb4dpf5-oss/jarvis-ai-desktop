@@ -54,6 +54,7 @@ from modules.app_manager import AppManager
 from modules.browser import Browser
 from modules.self_modify import SelfModifier
 from core.updater import Updater
+from ui.settings_dialog import SettingsDialog
 
 from ui.orb_widget import OrbWidget
 from ui.hud_panel import HudPanel
@@ -118,6 +119,18 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> None:
             _deep_merge(base[k], v)
         else:
             base[k] = v
+
+
+def save_config(config: Dict[str, Any]) -> bool:
+    """Persist the config dict to config/settings.json. Returns True on success."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2)
+        return True
+    except Exception as exc:
+        print(f"[config] failed to save settings.json: {exc}")
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +305,18 @@ class JarvisWindow(QWidget):
             "color:#00e5ff; font-family:Consolas,monospace; font-size:11px; background:transparent;"
         )
 
+        # Gear / settings button (top-right).
+        self.settings_btn = QPushButton("⚙", self)
+        self.settings_btn.setFixedSize(38, 38)
+        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn.setToolTip("Settings — API keys, voice, UI (Ctrl+,)")
+        self.settings_btn.setStyleSheet(
+            "QPushButton { background: rgba(0,229,255,20); color:#00e5ff;"
+            " border: 1px solid rgba(0,229,255,140); border-radius: 19px; font-size:18px; }"
+            "QPushButton:hover { background: rgba(0,229,255,70); }"
+        )
+        self.settings_btn.clicked.connect(self._open_settings)
+
         # Input row.
         self.input_box = QLineEdit(self)
         self.input_box.setPlaceholderText("Type a command, or speak…  (Ctrl+Space to talk)")
@@ -331,6 +356,7 @@ class JarvisWindow(QWidget):
         # Shortcuts.
         QShortcut(QKeySequence("Ctrl+Space"), self, activated=self._toggle_listening)
         QShortcut(QKeySequence("Ctrl+U"), self, activated=self._on_update)
+        QShortcut(QKeySequence("Ctrl+,"), self, activated=self._open_settings)
         QShortcut(QKeySequence("Ctrl+H"), self, activated=self._toggle_hud)
         QShortcut(QKeySequence("Escape"), self, activated=self._on_escape)
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
@@ -361,6 +387,7 @@ class JarvisWindow(QWidget):
         self.update_btn.setGeometry(row_x + row_w - 42, h - 56, 38, 38)
 
         self.status_label.setGeometry(20, 16, 200, 20)
+        self.settings_btn.setGeometry(w - 52, 14, 38, 38)
 
         self.hud_left._reposition()
         self.hud_right._reposition()
@@ -569,6 +596,46 @@ class JarvisWindow(QWidget):
             self._toggle_hud()
 
     # ================================================================== #
+    # Settings
+    # ================================================================== #
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self.config, self)
+        if dlg.exec() and dlg.result_config:
+            self.config = dlg.result_config
+            if save_config(self.config):
+                self._apply_settings_live()
+                self._append_transcript("JARVIS", "Settings saved.")
+                if self.config["voice"]["speak_responses"] and self.speaker:
+                    self.speaker.say("Settings saved.")
+            else:
+                self._append_transcript("JARVIS", "Could not write settings.json.")
+
+    def _apply_settings_live(self) -> None:
+        """Apply the settings that can change without a restart."""
+        llm = self.config.get("llm", {})
+        # Refresh the brain's credentials/model live.
+        try:
+            self.brain.configure(llm)
+        except Exception as exc:
+            self._log(f"[settings] brain reconfigure failed: {exc}")
+        # Update the status hint about online/offline.
+        try:
+            online = getattr(self.brain, "is_online", None)
+            if online is not None:
+                self._log(f"[settings] LLM online: {online}")
+        except Exception:
+            pass
+        # Speaker properties.
+        vcfg = self.config.get("voice", {})
+        try:
+            if self.speaker:
+                self.speaker.set_properties(
+                    rate=vcfg.get("rate"), volume=vcfg.get("volume"),
+                    voice_hint=vcfg.get("voice_hint"))
+        except Exception:
+            pass
+
+    # ================================================================== #
     # Self-update
     # ================================================================== #
     def _on_update(self) -> None:
@@ -667,7 +734,36 @@ class JarvisWindow(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+def _configure_dpi() -> None:
+    """Set DPI awareness BEFORE the QApplication is created.
+
+    On Windows, Qt tries to call SetProcessDpiAwarenessContext() itself, which
+    can print "Access is denied" when the process's DPI awareness was already
+    set (e.g. by the shell, a manifest, or a prior call). We set it explicitly
+    and early via the Win32 API so Qt finds it already configured and stays
+    quiet. Any failure here is harmless — the app still runs.
+    """
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            try:
+                ctypes.windll.user32.SetProcessDpiAwarenessContext(
+                    ctypes.c_void_p(-4))
+            except Exception:
+                # Fallback for older Windows: PROCESS_PER_MONITOR_DPI_AWARE = 2
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+                except Exception:
+                    ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    # Silence Qt's own DPI-context probe so it doesn't re-attempt (and warn).
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+
+
 def main() -> int:
+    _configure_dpi()
     config = load_config()
     app = QApplication(sys.argv)
     app.setApplicationName("JARVIS")

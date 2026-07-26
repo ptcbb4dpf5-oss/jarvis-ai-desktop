@@ -200,6 +200,27 @@ class VoiceSpeaker(QThread):
         self._running = False
         self._queue.put(None)
 
+    def set_properties(self, rate=None, volume=None, voice_hint=None) -> None:
+        """Update TTS properties live (from the Settings dialog)."""
+        if rate is not None:
+            self.rate = int(rate)
+        if volume is not None:
+            self.volume = float(volume)
+        if voice_hint is not None:
+            self.voice_hint = (voice_hint or "").lower()
+        try:
+            if self._engine:
+                self._engine.setProperty("rate", self.rate)
+                self._engine.setProperty("volume", self.volume)
+                if self.voice_hint:
+                    for v in self._engine.getProperty("voices"):
+                        meta = f"{getattr(v, 'name', '')} {getattr(v, 'id', '')}".lower()
+                        if self.voice_hint in meta:
+                            self._engine.setProperty("voice", v.id)
+                            break
+        except Exception:
+            pass
+
     @property
     def is_speaking(self) -> bool:
         return self._speaking

@@ -117,6 +117,25 @@ class Brain:
             self._client = None
             self.online = False
 
+    def configure(self, llm_cfg: Dict[str, Any]) -> bool:
+        """Re-apply LLM settings live (e.g. after the user pastes an API key in
+        the Settings dialog) and rebuild the client. Returns is_online."""
+        llm_cfg = llm_cfg or {}
+        self.config["llm"] = llm_cfg
+        self.api_key = (
+            os.environ.get(llm_cfg.get("api_key_env", "OPENAI_API_KEY"))
+            or llm_cfg.get("api_key")
+            or os.environ.get("ABACUS_API_KEY")
+        )
+        self.base_url = llm_cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL")
+        self.model = llm_cfg.get("model", "gpt-4o-mini")
+        self.temperature = float(llm_cfg.get("temperature", 0.6))
+        self.max_tokens = int(llm_cfg.get("max_tokens", 800))
+        self._client = None
+        self.online = False
+        self._init_client()
+        return self.is_online
+
     @property
     def is_online(self) -> bool:
         return self.online and self._client is not None
