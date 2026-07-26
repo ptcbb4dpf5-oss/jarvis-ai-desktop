@@ -305,6 +305,18 @@ class JarvisWindow(QWidget):
             "color:#00e5ff; font-family:Consolas,monospace; font-size:11px; background:transparent;"
         )
 
+        # Always-on system info tray (top-left). Compact live telemetry that is
+        # visible at all times, independent of the sliding HUD panel.
+        self.sys_tray = QLabel(self)
+        self.sys_tray.setTextFormat(Qt.TextFormat.RichText)
+        self.sys_tray.setStyleSheet(
+            "QLabel { background: rgba(4,12,18,150); color:#9be8ff;"
+            " border: 1px solid rgba(0,229,255,90); border-radius: 8px;"
+            " font-family: Consolas, 'Courier New', monospace; font-size: 11px;"
+            " padding: 8px 12px; }"
+        )
+        self.sys_tray.setText("SYSTEM\n…gathering…")
+
         # Gear / settings button (top-right).
         self.settings_btn = QPushButton("⚙", self)
         self.settings_btn.setFixedSize(38, 38)
@@ -387,6 +399,10 @@ class JarvisWindow(QWidget):
         self.update_btn.setGeometry(row_x + row_w - 42, h - 56, 38, 38)
 
         self.status_label.setGeometry(20, 16, 200, 20)
+        # System tray sits just under the status line, top-left.
+        self.sys_tray.adjustSize()
+        tray_w = max(190, self.sys_tray.width())
+        self.sys_tray.setGeometry(20, 44, tray_w, self.sys_tray.height())
         self.settings_btn.setGeometry(w - 52, 14, 38, 38)
 
         self.hud_left._reposition()
@@ -424,15 +440,22 @@ class JarvisWindow(QWidget):
         self.hud_timer = QTimer(self)
         self.hud_timer.timeout.connect(self._refresh_hud)
         self.hud_timer.start(1500)
+        # Populate the tray immediately so it isn't blank on launch.
+        QTimer.singleShot(250, self._refresh_hud)
 
     def _refresh_hud(self) -> None:
-        if not self.hud_left.is_shown:
-            return
         try:
             snap = self.system_monitor.snapshot()
         except Exception:
             return
         if "error" in snap:
+            self.sys_tray.setText("SYSTEM\nunavailable")
+            return
+
+        # Always-on top-left tray (updates whether or not the HUD is open).
+        self._update_tray(snap)
+
+        if not self.hud_left.is_shown:
             return
         self.hud_left.update_bar("cpu", snap.get("cpu_percent") or 0)
         self.hud_left.update_bar("ram", snap.get("ram_percent") or 0)
@@ -443,6 +466,37 @@ class JarvisWindow(QWidget):
             f"NET ↓{snap.get('net_down','?')}  ↑{snap.get('net_up','?')}",
             f"UP  {snap.get('uptime','?')}",
         ])
+
+    def _update_tray(self, snap: Dict[str, Any]) -> None:
+        """Render the compact always-on system tray in the top-left corner."""
+        def bar(pct: float) -> str:
+            pct = max(0.0, min(100.0, float(pct or 0)))
+            filled = int(round(pct / 10.0))
+            return "█" * filled + "░" * (10 - filled)
+
+        def col(pct: float) -> str:
+            pct = float(pct or 0)
+            return "#ff5555" if pct >= 85 else ("#ffb020" if pct >= 60 else "#00e5ff")
+
+        cpu = snap.get("cpu_percent") or 0
+        ram = snap.get("ram_percent") or 0
+        gpu = snap.get("gpu_percent")
+        rows = [
+            '<span style="color:#00e5ff;font-weight:bold;">◈ SYSTEM</span>',
+            f'<span style="color:{col(cpu)};">CPU {bar(cpu)} {cpu:>3.0f}%</span>',
+            f'<span style="color:{col(ram)};">RAM {bar(ram)} {ram:>3.0f}%</span>',
+        ]
+        if gpu is not None:
+            rows.append(f'<span style="color:{col(gpu)};">GPU {bar(gpu)} {gpu:>3.0f}%</span>')
+        rows.append(
+            f'<span style="color:#7fbfd0;">NET ↓{snap.get("net_down","?")} '
+            f'↑{snap.get("net_up","?")}</span>'
+        )
+        rows.append(f'<span style="color:#7fbfd0;">UP  {snap.get("uptime","?")}</span>')
+        self.sys_tray.setText("<br>".join(rows))
+        self.sys_tray.adjustSize()
+        self.sys_tray.setGeometry(20, 44, max(190, self.sys_tray.width()),
+                                  self.sys_tray.height())
 
     def _toggle_hud(self) -> None:
         self.hud_left.toggle()

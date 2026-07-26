@@ -287,6 +287,23 @@ class SelfModifier:
 
         self.log(f"creating capability '{capability}' -> {slug}.py")
 
+        # Be honest up-front: the plugin engine adds *voice/text commands*, it
+        # cannot restructure Jarvis's own live window (add panels, move the orb,
+        # change buttons). Pretending otherwise is exactly the "it said it did it
+        # but nothing happened" problem. Detect those requests and say so.
+        if self._is_ui_request(capability):
+            return (
+                "Heads up — my self-modify engine adds new *commands* (plugins), "
+                "it can't rebuild my own on-screen interface live. So I won't "
+                "pretend I added a UI element.\n"
+                "• A live system-info tray is already built into the top-left "
+                "corner.\n"
+                "• For other interface changes, ask the developer to edit the app "
+                "and press ⟳ Update.\n"
+                "If instead you want a new command (e.g. 'tell me the weather'), "
+                "just describe what it should DO and I'll build it."
+            )
+
         code = self._generate_plugin_code(capability, slug)
         if not code:
             return ("I couldn't generate that capability — my code generator is "
@@ -330,8 +347,72 @@ class SelfModifier:
 
         plugin = self._plugins.get(self._match_plugin_name(slug)) or None
         pname = plugin.name if plugin else slug
-        return (f"Done. I've added the '{pname}' capability and loaded it live — "
-                f"no restart needed. Want me to test it?")
+
+        # Actually VERIFY it works before claiming success — don't just assume.
+        verdict, sample = self._verify_plugin(plugin)
+        if verdict == "ok":
+            trig = ", ".join((plugin.keywords or [])[:3]) if plugin else ""
+            trig_txt = f" Try saying: \"{plugin.keywords[0]}\"." if plugin and plugin.keywords else ""
+            return (f"Done and verified. The '{pname}' capability is loaded and "
+                    f"responded correctly in a test run.{trig_txt}")
+        if verdict == "stub":
+            return (f"I registered '{pname}', but it's only a placeholder stub right "
+                    f"now (no real logic yet). Connect an AI key so I can write the "
+                    f"full version, or edit plugins/{slug}.py.")
+        # verdict == "error"
+        return (f"I saved and loaded '{pname}', but my test run failed: {sample} "
+                f"The file is at plugins/{slug}.py if you want to inspect it.")
+
+    # ------------------------------------------------------------------ #
+    _UI_HINTS = (
+        "tray", "panel", "widget", "button", "window", "orb", "hud", "layout",
+        "top left", "top-left", "top right", "top-right", "bottom", "corner",
+        "sidebar", "menu bar", "titlebar", "on screen", "on the screen",
+        "display it on", "show it on", "add a box", "gui", "interface",
+        "move the", "resize", "recolor", "re-color", "change the color of",
+        "theme", "skin",
+    )
+
+    def _is_ui_request(self, capability: str) -> bool:
+        """Heuristic: is the user asking to change Jarvis's own live interface?"""
+        c = (capability or "").lower()
+        if not any(h in c for h in self._UI_HINTS):
+            return False
+        # If it also clearly asks to fetch/compute data, treat as a real command
+        # only when there's no explicit "add/create ... <ui element>" phrasing.
+        wants_ui_element = bool(re.search(
+            r"\b(add|create|make|build|put|place|show|display)\b.*"
+            r"\b(tray|panel|widget|button|box|window|orb|hud|sidebar|menu|corner)\b",
+            c))
+        return wants_ui_element or any(
+            k in c for k in ("move the", "resize", "recolor", "change the color",
+                             "theme", "skin", "layout"))
+
+    def _verify_plugin(self, plugin: "JarvisPlugin"):
+        """Smoke-test a freshly loaded plugin. Returns (verdict, detail).
+
+        verdict is one of: "ok", "stub", "error".
+        """
+        if plugin is None:
+            return "error", "plugin object was None after load."
+        # Build a sample utterance from its own keywords.
+        sample = (plugin.keywords[0] if getattr(plugin, "keywords", None)
+                  else plugin.name.replace("_", " "))
+        try:
+            if not plugin.can_handle(sample):
+                # Not fatal, but note it — routing may never reach it.
+                self.log(f"verify: '{plugin.name}' can_handle('{sample}') is False")
+            result = plugin.handle(sample, self._agent)
+            text = ("" if result is None else str(result)).strip()
+        except Exception as exc:
+            return "error", f"{type(exc).__name__}: {exc}"
+        if not text:
+            return "error", "handle() returned nothing."
+        # Detect the offline placeholder stub so we don't over-promise.
+        low = text.lower()
+        if "not yet implemented" in low or "placeholder" in low or "todo" in low:
+            return "stub", text
+        return "ok", text
 
     # ------------------------------------------------------------------ #
     def _generate_plugin_code(self, capability: str, slug: str) -> str:

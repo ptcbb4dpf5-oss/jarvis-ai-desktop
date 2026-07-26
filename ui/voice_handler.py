@@ -226,29 +226,46 @@ class VoiceSpeaker(QThread):
         return self._speaking
 
     # ------------------------------------------------------------------ #
-    def _init_engine(self) -> bool:
+    def _make_engine(self):
+        """Create a *fresh* pyttsx3 engine configured with current properties.
+
+        IMPORTANT: On Windows (SAPI5) a single engine instance only speaks
+        reliably on the FIRST ``runAndWait()`` — subsequent calls silently do
+        nothing, which is why Jarvis used to talk only once (the greeting) and
+        then go quiet. Building a new engine per utterance avoids that entirely.
+        """
         if not _TTS:
-            self.unavailable.emit("pyttsx3 not installed; voice output disabled.")
-            return False
+            return None
         try:
-            self._engine = pyttsx3.init()
-            self._engine.setProperty("rate", self.rate)
-            self._engine.setProperty("volume", self.volume)
+            eng = pyttsx3.init()
+            eng.setProperty("rate", self.rate)
+            eng.setProperty("volume", self.volume)
             if self.voice_hint:
-                for v in self._engine.getProperty("voices"):
+                for v in eng.getProperty("voices"):
                     meta = f"{getattr(v, 'name', '')} {getattr(v, 'id', '')}".lower()
                     if self.voice_hint in meta:
-                        self._engine.setProperty("voice", v.id)
+                        eng.setProperty("voice", v.id)
                         break
-            return True
+            return eng
         except Exception as exc:
             self.unavailable.emit(f"TTS engine failed to start: {exc}")
-            return False
+            return None
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:  # noqa: D401
-        if not self._init_engine():
+        if not _TTS:
+            self.unavailable.emit("pyttsx3 not installed; voice output disabled.")
             return
+        # Verify we can build an engine at least once (surfaces missing voices).
+        probe = self._make_engine()
+        if probe is None:
+            return
+        try:
+            probe.stop()
+        except Exception:
+            pass
+        del probe
+
         self._running = True
         while self._running:
             try:
@@ -258,12 +275,6 @@ class VoiceSpeaker(QThread):
             if text is None:
                 break
             self._speak_one(text)
-
-        try:
-            if self._engine:
-                self._engine.stop()
-        except Exception:
-            pass
 
     def _speak_one(self, text: str) -> None:
         self._speaking = True
@@ -282,12 +293,22 @@ class VoiceSpeaker(QThread):
 
         amp_t = threading.Thread(target=pulse, daemon=True)
         amp_t.start()
+        # Fresh engine every time — see _make_engine() docstring.
+        engine = self._make_engine()
         try:
-            self._engine.say(text)
-            self._engine.runAndWait()
+            if engine is not None:
+                self._engine = engine  # keep a ref so set_properties() can peek
+                engine.say(text)
+                engine.runAndWait()
         except Exception:
             pass
         finally:
+            try:
+                if engine is not None:
+                    engine.stop()
+            except Exception:
+                pass
+            self._engine = None
             stop_amp.set()
             self._speaking = False
             self.amplitude.emit(0.0)
