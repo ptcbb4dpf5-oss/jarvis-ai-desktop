@@ -54,11 +54,15 @@ from modules.app_manager import AppManager
 from modules.browser import Browser
 from modules.self_modify import SelfModifier
 from core.updater import Updater
+from core.reasoning import ReasoningEngine
+from core.projects import ProjectManager
 from ui.settings_dialog import SettingsDialog
+from ui.projects_panel import ProjectsPanel
 
 from ui.orb_widget import OrbWidget
 from ui.hud_panel import HudPanel
-from ui.voice_handler import VoiceListener, VoiceSpeaker
+from ui.system_tray import SystemTray
+from ui.voice_handler import VoiceListener, VoiceSpeaker, DEFAULT_JARVIS_VOICE_ID
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +90,12 @@ def load_config() -> Dict[str, Any]:
             "voice_hint": "",
             "language": "en-US",
             "stt_engine": "google",
+            "engine": "pyttsx3",
+            "elevenlabs": {
+                "api_key": "",
+                "voice_id": "",
+                "model": "eleven_turbo_v2_5",
+            },
         },
         "ui": {
             "start_fullscreen": False,
@@ -228,6 +238,15 @@ class JarvisWindow(QWidget):
             "self_modify": self.self_modifier,
         }
 
+        # Higher-order reasoning (reflect / multi-model debate) + project engine.
+        self.reasoning = ReasoningEngine(self.brain, log_cb=self._log)
+        self.projects = ProjectManager(
+            self.brain, reasoning=self.reasoning, app_root=APP_DIR, log_cb=self._log,
+        )
+
+        self.modules["reasoning"] = self.reasoning
+        self.modules["projects"] = self.projects
+
         self.agent = Agent(
             self.brain, self.memory, self.modules,
             state_cb=self._on_agent_state,   # called from worker thread
@@ -235,6 +254,7 @@ class JarvisWindow(QWidget):
             log_cb=self._log,
         )
         self.self_modifier.set_agent(self.agent)
+        self._projects_panel: Optional[ProjectsPanel] = None
 
         # Load + hot-reload plugins.
         self.self_modifier.load_all()
@@ -305,17 +325,10 @@ class JarvisWindow(QWidget):
             "color:#00e5ff; font-family:Consolas,monospace; font-size:11px; background:transparent;"
         )
 
-        # Always-on system info tray (top-left). Compact live telemetry that is
-        # visible at all times, independent of the sliding HUD panel.
-        self.sys_tray = QLabel(self)
-        self.sys_tray.setTextFormat(Qt.TextFormat.RichText)
-        self.sys_tray.setStyleSheet(
-            "QLabel { background: rgba(4,12,18,150); color:#9be8ff;"
-            " border: 1px solid rgba(0,229,255,90); border-radius: 8px;"
-            " font-family: Consolas, 'Courier New', monospace; font-size: 11px;"
-            " padding: 8px 12px; }"
-        )
-        self.sys_tray.setText("SYSTEM\n…gathering…")
+        # Always-on system info tray (top-left). A modern, futuristic panel with
+        # circular ring gauges (CPU / RAM / GPU / DISK), core temperatures and
+        # net/uptime readouts — drawn programmatically, always visible.
+        self.sys_tray = SystemTray(self)
 
         # Gear / settings button (top-right).
         self.settings_btn = QPushButton("⚙", self)
@@ -328,6 +341,14 @@ class JarvisWindow(QWidget):
             "QPushButton:hover { background: rgba(0,229,255,70); }"
         )
         self.settings_btn.clicked.connect(self._open_settings)
+
+        # Projects / self-dev button (top-right, next to settings).
+        self.projects_btn = QPushButton("🛠", self)
+        self.projects_btn.setFixedSize(38, 38)
+        self.projects_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.projects_btn.setToolTip("Projects & Self-Development — build apps, improve Jarvis (Ctrl+P)")
+        self.projects_btn.setStyleSheet(self.settings_btn.styleSheet())
+        self.projects_btn.clicked.connect(self._open_projects)
 
         # Input row.
         self.input_box = QLineEdit(self)
@@ -369,6 +390,7 @@ class JarvisWindow(QWidget):
         QShortcut(QKeySequence("Ctrl+Space"), self, activated=self._toggle_listening)
         QShortcut(QKeySequence("Ctrl+U"), self, activated=self._on_update)
         QShortcut(QKeySequence("Ctrl+,"), self, activated=self._open_settings)
+        QShortcut(QKeySequence("Ctrl+P"), self, activated=self._open_projects)
         QShortcut(QKeySequence("Ctrl+H"), self, activated=self._toggle_hud)
         QShortcut(QKeySequence("Escape"), self, activated=self._on_escape)
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
@@ -399,11 +421,11 @@ class JarvisWindow(QWidget):
         self.update_btn.setGeometry(row_x + row_w - 42, h - 56, 38, 38)
 
         self.status_label.setGeometry(20, 16, 200, 20)
-        # System tray sits just under the status line, top-left.
-        self.sys_tray.adjustSize()
-        tray_w = max(190, self.sys_tray.width())
-        self.sys_tray.setGeometry(20, 44, tray_w, self.sys_tray.height())
+        # System tray (fixed-size gauge panel) sits under the status line, top-left.
+        self.sys_tray.move(20, 44)
+        # Top-right buttons: [🛠 projects] [⚙ settings]
         self.settings_btn.setGeometry(w - 52, 14, 38, 38)
+        self.projects_btn.setGeometry(w - 98, 14, 38, 38)
 
         self.hud_left._reposition()
         self.hud_right._reposition()
@@ -449,11 +471,11 @@ class JarvisWindow(QWidget):
         except Exception:
             return
         if "error" in snap:
-            self.sys_tray.setText("SYSTEM\nunavailable")
+            self.sys_tray.update_snapshot(snap)
             return
 
         # Always-on top-left tray (updates whether or not the HUD is open).
-        self._update_tray(snap)
+        self.sys_tray.update_snapshot(snap)
 
         if not self.hud_left.is_shown:
             return
@@ -466,37 +488,6 @@ class JarvisWindow(QWidget):
             f"NET ↓{snap.get('net_down','?')}  ↑{snap.get('net_up','?')}",
             f"UP  {snap.get('uptime','?')}",
         ])
-
-    def _update_tray(self, snap: Dict[str, Any]) -> None:
-        """Render the compact always-on system tray in the top-left corner."""
-        def bar(pct: float) -> str:
-            pct = max(0.0, min(100.0, float(pct or 0)))
-            filled = int(round(pct / 10.0))
-            return "█" * filled + "░" * (10 - filled)
-
-        def col(pct: float) -> str:
-            pct = float(pct or 0)
-            return "#ff5555" if pct >= 85 else ("#ffb020" if pct >= 60 else "#00e5ff")
-
-        cpu = snap.get("cpu_percent") or 0
-        ram = snap.get("ram_percent") or 0
-        gpu = snap.get("gpu_percent")
-        rows = [
-            '<span style="color:#00e5ff;font-weight:bold;">◈ SYSTEM</span>',
-            f'<span style="color:{col(cpu)};">CPU {bar(cpu)} {cpu:>3.0f}%</span>',
-            f'<span style="color:{col(ram)};">RAM {bar(ram)} {ram:>3.0f}%</span>',
-        ]
-        if gpu is not None:
-            rows.append(f'<span style="color:{col(gpu)};">GPU {bar(gpu)} {gpu:>3.0f}%</span>')
-        rows.append(
-            f'<span style="color:#7fbfd0;">NET ↓{snap.get("net_down","?")} '
-            f'↑{snap.get("net_up","?")}</span>'
-        )
-        rows.append(f'<span style="color:#7fbfd0;">UP  {snap.get("uptime","?")}</span>')
-        self.sys_tray.setText("<br>".join(rows))
-        self.sys_tray.adjustSize()
-        self.sys_tray.setGeometry(20, 44, max(190, self.sys_tray.width()),
-                                  self.sys_tray.height())
 
     def _toggle_hud(self) -> None:
         self.hud_left.toggle()
@@ -511,9 +502,15 @@ class JarvisWindow(QWidget):
         vcfg = self.config["voice"]
         if not vcfg.get("enabled", True):
             return
-        # Speaker.
+        # Speaker. Supports the local system voice (pyttsx3) or the cinematic
+        # Iron-Man "JARVIS" voice via ElevenLabs when a key is set.
+        ecfg = vcfg.get("elevenlabs", {}) or {}
         self.speaker = VoiceSpeaker(
-            rate=vcfg["rate"], volume=vcfg["volume"], voice_hint=vcfg["voice_hint"]
+            rate=vcfg["rate"], volume=vcfg["volume"], voice_hint=vcfg["voice_hint"],
+            engine=vcfg.get("engine", "pyttsx3"),
+            eleven_api_key=ecfg.get("api_key", ""),
+            eleven_voice_id=ecfg.get("voice_id", "") or DEFAULT_JARVIS_VOICE_ID,
+            eleven_model=ecfg.get("model", "eleven_turbo_v2_5"),
         )
         self.speaker.speaking_started.connect(lambda: self._set_orb_state(STATE_SPEAKING))
         self.speaker.speaking_finished.connect(self._on_speaking_finished)
@@ -652,6 +649,17 @@ class JarvisWindow(QWidget):
     # ================================================================== #
     # Settings
     # ================================================================== #
+    def _open_projects(self) -> None:
+        """Open the Projects & Self-Development workspace (non-modal)."""
+        if self._projects_panel is not None and self._projects_panel.isVisible():
+            self._projects_panel.raise_()
+            self._projects_panel.activateWindow()
+            return
+        self._projects_panel = ProjectsPanel(self.projects, self)
+        self._projects_panel.show()
+        self._projects_panel.raise_()
+        self._projects_panel.activateWindow()
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.config, self)
         if dlg.exec() and dlg.result_config:
@@ -681,11 +689,16 @@ class JarvisWindow(QWidget):
             pass
         # Speaker properties.
         vcfg = self.config.get("voice", {})
+        ecfg = vcfg.get("elevenlabs", {}) or {}
         try:
             if self.speaker:
                 self.speaker.set_properties(
                     rate=vcfg.get("rate"), volume=vcfg.get("volume"),
-                    voice_hint=vcfg.get("voice_hint"))
+                    voice_hint=vcfg.get("voice_hint"),
+                    engine=vcfg.get("engine"),
+                    eleven_api_key=ecfg.get("api_key", ""),
+                    eleven_voice_id=ecfg.get("voice_id", "") or DEFAULT_JARVIS_VOICE_ID,
+                    eleven_model=ecfg.get("model", "eleven_turbo_v2_5"))
         except Exception:
             pass
 
@@ -771,6 +784,11 @@ class JarvisWindow(QWidget):
         try:
             if self._update_worker:
                 self._update_worker.wait(2000)
+        except Exception:
+            pass
+        try:
+            if self._projects_panel is not None:
+                self._projects_panel.close()
         except Exception:
             pass
         try:

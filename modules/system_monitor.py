@@ -203,6 +203,71 @@ class SystemMonitor:
         procs.sort(key=lambda x: x["cpu"], reverse=True)
         return {"top": procs[:limit], "count": len(procs)}
 
+    def temperatures(self) -> Dict[str, Any]:
+        """Best-effort CPU / core temperatures.
+
+        Note: psutil.sensors_temperatures() exists on Linux/macOS but NOT on
+        Windows (Python's psutil can't read Windows thermal sensors). On Windows
+        we try the OpenHardwareMonitor / LibreHardwareMonitor WMI namespace if
+        the user is running one of those tools; otherwise temps are reported as
+        unavailable rather than faked.
+        """
+        result: Dict[str, Any] = {"cpu": None, "cores": [], "gpu": None, "source": None}
+
+        # 1) psutil (Linux/macOS mainly).
+        if _PSUTIL and hasattr(psutil, "sensors_temperatures"):
+            try:
+                temps = psutil.sensors_temperatures(fahrenheit=False) or {}
+                cores: List[float] = []
+                pkg = None
+                for name, entries in temps.items():
+                    for e in entries:
+                        if e.current is None:
+                            continue
+                        label = (e.label or name or "").lower()
+                        if "package" in label or "tctl" in label or "cpu" in label:
+                            pkg = e.current if pkg is None else max(pkg, e.current)
+                        if "core" in label:
+                            cores.append(round(e.current, 1))
+                if pkg is not None or cores:
+                    result.update({
+                        "cpu": round(pkg, 1) if pkg is not None else (max(cores) if cores else None),
+                        "cores": cores,
+                        "source": "psutil",
+                    })
+                    return result
+            except Exception:
+                pass
+
+        # 2) Windows: OpenHardwareMonitor / LibreHardwareMonitor via WMI.
+        if platform.system() == "Windows":
+            for namespace in (r"root\OpenHardwareMonitor", r"root\LibreHardwareMonitor"):
+                try:
+                    import wmi  # type: ignore
+                    w = wmi.WMI(namespace=namespace)
+                    cores = []
+                    pkg = None
+                    for sensor in w.Sensor():
+                        if sensor.SensorType != "Temperature":
+                            continue
+                        nm = (sensor.Name or "").lower()
+                        val = float(sensor.Value)
+                        if "package" in nm or "cpu" in nm and "core" not in nm:
+                            pkg = val if pkg is None else max(pkg, val)
+                        elif "core" in nm:
+                            cores.append(round(val, 1))
+                    if pkg is not None or cores:
+                        result.update({
+                            "cpu": round(pkg, 1) if pkg is not None else max(cores),
+                            "cores": cores,
+                            "source": namespace.split("\\")[-1],
+                        })
+                        return result
+                except Exception:
+                    continue
+
+        return result
+
     def uptime(self) -> Dict[str, Any]:
         if not _PSUTIL:
             return {"error": "psutil not installed"}
@@ -224,13 +289,37 @@ class SystemMonitor:
         ram = self.ram()
         net = self.network()
         gpu = self.gpu()
-        gpu_load = gpu["gpus"][0]["load_percent"] if gpu.get("gpus") else None
+        gpu0 = gpu["gpus"][0] if gpu.get("gpus") else None
+        gpu_load = gpu0["load_percent"] if gpu0 else None
+        gpu_temp = gpu0.get("temp") if gpu0 else None
+
+        # Primary disk (the partition holding the OS / first fixed drive).
+        disk = self.disk()
+        parts = disk.get("partitions", [])
+        main = parts[0] if parts else {}
+        # Prefer C: on Windows if present.
+        for p in parts:
+            if str(p.get("device", "")).upper().startswith("C:") or p.get("mount") in ("/", "C:\\"):
+                main = p
+                break
+
+        temps = self.temperatures()
+
         return {
             "cpu_percent": cpu.get("percent"),
+            "cpu_temp": temps.get("cpu"),
+            "core_temps": temps.get("cores", []),
+            "temp_source": temps.get("source"),
             "ram_percent": ram.get("percent"),
             "ram_used_h": ram.get("used_h"),
             "ram_total_h": ram.get("total_h"),
             "gpu_percent": gpu_load,
+            "gpu_temp": gpu_temp,
+            "disk_percent": main.get("percent"),
+            "disk_used_h": main.get("used_h"),
+            "disk_total_h": main.get("total_h"),
+            "disk_free_h": main.get("free_h"),
+            "disk_device": main.get("device"),
             "net_down": net.get("down_rate_h"),
             "net_up": net.get("up_rate_h"),
             "uptime": self.uptime().get("human"),

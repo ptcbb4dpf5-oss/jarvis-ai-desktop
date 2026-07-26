@@ -21,9 +21,15 @@ the user rather than crash.
 
 from __future__ import annotations
 
+import os
+import platform
 import queue
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
+import wave
 from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -41,6 +47,17 @@ try:
 except Exception:  # pragma: no cover
     pyttsx3 = None  # type: ignore
     _TTS = False
+
+try:
+    import requests  # type: ignore
+    _REQUESTS = True
+except Exception:  # pragma: no cover
+    requests = None  # type: ignore
+    _REQUESTS = False
+
+# A classic refined British male voice for the Iron-Man "JARVIS" feel.
+# This is an ElevenLabs stock voice id ("George" — British, warm/authoritative).
+DEFAULT_JARVIS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 
 
 # --------------------------------------------------------------------------- #
@@ -180,11 +197,19 @@ class VoiceSpeaker(QThread):
     unavailable = pyqtSignal(str)
 
     def __init__(self, rate: int = 178, volume: float = 1.0,
-                 voice_hint: str = "", parent=None) -> None:
+                 voice_hint: str = "", engine: str = "pyttsx3",
+                 eleven_api_key: str = "", eleven_voice_id: str = "",
+                 eleven_model: str = "eleven_turbo_v2_5", parent=None) -> None:
         super().__init__(parent)
         self.rate = rate
         self.volume = volume
+        # Default hint nudges pyttsx3 toward a male voice for the JARVIS feel.
         self.voice_hint = (voice_hint or "").lower()
+        self.engine_name = (engine or "pyttsx3").lower()
+        self.eleven_api_key = eleven_api_key or ""
+        self.eleven_voice_id = eleven_voice_id or DEFAULT_JARVIS_VOICE_ID
+        self.eleven_model = eleven_model or "eleven_turbo_v2_5"
+        self._eleven_ok = None  # lazy health flag
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._running = False
         self._engine = None
@@ -192,6 +217,11 @@ class VoiceSpeaker(QThread):
         self._speaking = False
 
     # ------------------------------------------------------------------ #
+    @property
+    def _use_eleven(self) -> bool:
+        return (self.engine_name == "elevenlabs"
+                and bool(self.eleven_api_key) and _REQUESTS)
+
     def say(self, text: str) -> None:
         if text:
             self._queue.put(text)
@@ -200,7 +230,9 @@ class VoiceSpeaker(QThread):
         self._running = False
         self._queue.put(None)
 
-    def set_properties(self, rate=None, volume=None, voice_hint=None) -> None:
+    def set_properties(self, rate=None, volume=None, voice_hint=None,
+                       engine=None, eleven_api_key=None, eleven_voice_id=None,
+                       eleven_model=None) -> None:
         """Update TTS properties live (from the Settings dialog)."""
         if rate is not None:
             self.rate = int(rate)
@@ -208,6 +240,15 @@ class VoiceSpeaker(QThread):
             self.volume = float(volume)
         if voice_hint is not None:
             self.voice_hint = (voice_hint or "").lower()
+        if engine is not None:
+            self.engine_name = (engine or "pyttsx3").lower()
+        if eleven_api_key is not None:
+            self.eleven_api_key = eleven_api_key or ""
+            self._eleven_ok = None  # re-test on next use
+        if eleven_voice_id is not None:
+            self.eleven_voice_id = eleven_voice_id or DEFAULT_JARVIS_VOICE_ID
+        if eleven_model is not None:
+            self.eleven_model = eleven_model or "eleven_turbo_v2_5"
         try:
             if self._engine:
                 self._engine.setProperty("rate", self.rate)
@@ -293,23 +334,126 @@ class VoiceSpeaker(QThread):
 
         amp_t = threading.Thread(target=pulse, daemon=True)
         amp_t.start()
-        # Fresh engine every time — see _make_engine() docstring.
-        engine = self._make_engine()
+
+        spoke = False
         try:
-            if engine is not None:
-                self._engine = engine  # keep a ref so set_properties() can peek
-                engine.say(text)
-                engine.runAndWait()
+            # Preferred path: the true Iron-Man "JARVIS" voice via ElevenLabs.
+            if self._use_eleven:
+                spoke = self._speak_eleven(text)
+            # Fallback (or default): local pyttsx3 — fresh engine every time,
+            # see _make_engine() docstring for why.
+            if not spoke:
+                engine = self._make_engine()
+                if engine is not None:
+                    self._engine = engine  # so set_properties() can peek
+                    try:
+                        engine.say(text)
+                        engine.runAndWait()
+                    finally:
+                        try:
+                            engine.stop()
+                        except Exception:
+                            pass
+                        self._engine = None
         except Exception:
             pass
         finally:
-            try:
-                if engine is not None:
-                    engine.stop()
-            except Exception:
-                pass
-            self._engine = None
             stop_amp.set()
             self._speaking = False
             self.amplitude.emit(0.0)
             self.speaking_finished.emit()
+
+    # ------------------------------------------------------------------ #
+    def _speak_eleven(self, text: str) -> bool:
+        """Synthesize `text` with ElevenLabs and play it. Returns True on success.
+
+        On any failure (bad key, no network, playback tool missing) we return
+        False so the caller falls back to local pyttsx3 — Jarvis always talks.
+        """
+        if not (_REQUESTS and self.eleven_api_key):
+            return False
+        voice_id = self.eleven_voice_id or DEFAULT_JARVIS_VOICE_ID
+        url = (f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+               f"?output_format=pcm_24000")
+        headers = {
+            "xi-api-key": self.eleven_api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/pcm",
+        }
+        payload = {
+            "text": text,
+            "model_id": self.eleven_model or "eleven_turbo_v2_5",
+            "voice_settings": {
+                "stability": 0.45,
+                "similarity_boost": 0.85,
+                "style": 0.15,
+                "use_speaker_boost": True,
+            },
+        }
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.status_code != 200 or not resp.content:
+                self._eleven_ok = False
+                if resp.status_code in (401, 403):
+                    self.unavailable.emit(
+                        "ElevenLabs key rejected — falling back to system voice."
+                    )
+                return False
+            self._eleven_ok = True
+            # ElevenLabs pcm_24000 = raw 16-bit mono PCM @ 24 kHz. Wrap as WAV.
+            wav_path = self._pcm_to_wav(resp.content, rate=24000)
+            if not wav_path:
+                return False
+            played = self._play_wav(wav_path)
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+            return played
+        except Exception:
+            self._eleven_ok = False
+            return False
+
+    @staticmethod
+    def _pcm_to_wav(pcm: bytes, rate: int = 24000) -> Optional[str]:
+        try:
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_tts_")
+            os.close(fd)
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)  # 16-bit
+                w.setframerate(rate)
+                w.writeframes(pcm)
+            return path
+        except Exception:
+            return None
+
+    def _play_wav(self, path: str) -> bool:
+        """Play a WAV file blocking until done, cross-platform, best-effort."""
+        system = platform.system()
+        try:
+            if system == "Windows":
+                import winsound  # type: ignore
+                winsound.PlaySound(path, winsound.SND_FILENAME)
+                return True
+        except Exception:
+            pass
+        # macOS / Linux: try common players in order.
+        for player in ("afplay", "aplay", "ffplay", "paplay"):
+            exe = shutil.which(player)
+            if not exe:
+                continue
+            try:
+                if player == "ffplay":
+                    cmd = [exe, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+                elif player == "aplay":
+                    cmd = [exe, "-q", path]
+                else:
+                    cmd = [exe, path]
+                subprocess.run(cmd, check=True,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                continue
+        return False

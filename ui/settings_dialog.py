@@ -161,6 +161,7 @@ class SettingsDialog(QDialog):
         root.addWidget(self.tabs, 1)
         self._build_providers_tab()
         self._build_agents_tab()
+        self._build_voice_tab()
         self._build_more_tab()
 
         # Default / active picker.
@@ -231,6 +232,111 @@ class SettingsDialog(QDialog):
         v.addStretch(1)
         self.tabs.addTab(area, "Agents")
 
+    def _build_voice_tab(self) -> None:
+        area, v = self._scroll_body()
+        vcfg = self._config.setdefault("voice", {})
+        ecfg = vcfg.setdefault("elevenlabs", {})
+
+        intro = QLabel("Pick how Jarvis sounds. <b>System voice</b> works "
+                       "offline out of the box. <b>ElevenLabs</b> gives the "
+                       "real cinematic Iron-Man &ldquo;JARVIS&rdquo; voice "
+                       "(needs a free key + internet).")
+        intro.setStyleSheet("color:#8fbfcf; font-size:11px;")
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+
+        # --- Engine selector ---
+        eng_row = QHBoxLayout()
+        eng_row.addWidget(QLabel("Voice engine:"))
+        self.voice_engine = QComboBox()
+        self.voice_engine.addItem("System voice (offline)", "pyttsx3")
+        self.voice_engine.addItem("ElevenLabs — JARVIS voice", "elevenlabs")
+        cur_eng = (vcfg.get("engine", "pyttsx3") or "pyttsx3").lower()
+        idx = self.voice_engine.findData(cur_eng)
+        if idx >= 0:
+            self.voice_engine.setCurrentIndex(idx)
+        eng_row.addWidget(self.voice_engine, 1)
+        v.addLayout(eng_row)
+
+        # --- ElevenLabs card ---
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame { background: rgba(0,229,255,10); border:1px solid rgba(0,229,255,70);"
+            " border-radius:10px; }")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.setSpacing(6)
+
+        head = QHBoxLayout()
+        nm = QLabel("ElevenLabs")
+        nm.setStyleSheet(f"color:{CYAN}; font-size:15px; font-weight:bold;")
+        head.addWidget(nm)
+        badge = QLabel("FREE TIER")
+        badge.setStyleSheet(
+            f"color:{GREEN}; font-size:10px; font-weight:bold;"
+            f" border:1px solid {GREEN}; border-radius:8px; padding:1px 8px;")
+        head.addWidget(badge)
+        head.addStretch(1)
+        get = QLabel(f'<a style="color:{CYAN}; text-decoration:none;" '
+                     f'href="https://elevenlabs.io/app/settings/api-keys">Get key ↗</a>')
+        get.setOpenExternalLinks(True)
+        get.setStyleSheet("font-size:12px;")
+        head.addWidget(get)
+        cl.addLayout(head)
+
+        blurb = QLabel("Paste your ElevenLabs API key to unlock the real JARVIS "
+                       "voice. The default voice id is a refined British male — "
+                       "change it to any voice id from your ElevenLabs library.")
+        blurb.setStyleSheet("color:#8fbfcf; font-size:10px;")
+        blurb.setWordWrap(True)
+        cl.addWidget(blurb)
+
+        krow = QHBoxLayout()
+        saved_key = ecfg.get("api_key", "")
+        self.eleven_key = QLineEdit(saved_key)
+        self.eleven_key.setPlaceholderText("Paste ElevenLabs API key here  (sk_...)")
+        self.eleven_key.setEchoMode(QLineEdit.EchoMode.Password if saved_key
+                                    else QLineEdit.EchoMode.Normal)
+        krow.addWidget(self.eleven_key, 1)
+        self.eleven_dot = QLabel()
+        self._set_dot(self.eleven_dot, bool(saved_key.strip()))
+        self.eleven_key.textChanged.connect(
+            lambda t: self._set_dot(self.eleven_dot, bool(t.strip())))
+        krow.addWidget(self.eleven_dot)
+        cl.addLayout(krow)
+
+        vid_row = QHBoxLayout()
+        vid_row.addWidget(QLabel("Voice id:"))
+        from ui.voice_handler import DEFAULT_JARVIS_VOICE_ID
+        self.eleven_voice = QLineEdit(ecfg.get("voice_id", "") or DEFAULT_JARVIS_VOICE_ID)
+        self.eleven_voice.setPlaceholderText(DEFAULT_JARVIS_VOICE_ID)
+        vid_row.addWidget(self.eleven_voice, 1)
+        cl.addLayout(vid_row)
+        v.addWidget(card)
+
+        # --- Rate / volume sliders (apply to system voice) ---
+        self.voice_rate = QLineEdit(str(vcfg.get("rate", 178)))
+        self.voice_rate.setPlaceholderText("178")
+        rr = QHBoxLayout()
+        rr.addWidget(QLabel("Speaking rate (system voice):"))
+        rr.addWidget(self.voice_rate, 1)
+        v.addLayout(rr)
+
+        self.voice_speak = QCheckBox("Speak responses aloud")
+        self.voice_speak.setChecked(bool(vcfg.get("speak_responses", True)))
+        v.addWidget(self.voice_speak)
+
+        v.addStretch(1)
+        self.tabs.addTab(area, "Voice")
+
+    def _set_dot(self, dot: QLabel, connected: bool) -> None:
+        if connected:
+            dot.setText("● connected")
+            dot.setStyleSheet(f"color:{GREEN}; font-size:11px;")
+        else:
+            dot.setText("○ not set")
+            dot.setStyleSheet("color:#5f7f8f; font-size:11px;")
+
     def _build_more_tab(self) -> None:
         area, v = self._scroll_body()
         vcfg = self._config.setdefault("voice", {})
@@ -238,12 +344,10 @@ class SettingsDialog(QDialog):
 
         self.voice_enabled = QCheckBox("Enable voice (listen + speak)")
         self.voice_enabled.setChecked(bool(vcfg.get("enabled", True)))
-        self.speak_responses = QCheckBox("Speak responses aloud")
-        self.speak_responses.setChecked(bool(vcfg.get("speak_responses", True)))
         self.start_fullscreen = QCheckBox("Start in fullscreen")
         self.start_fullscreen.setChecked(bool(ucfg.get("start_fullscreen", False)))
 
-        for w in (self.voice_enabled, self.speak_responses, self.start_fullscreen):
+        for w in (self.voice_enabled, self.start_fullscreen):
             v.addWidget(w)
         v.addStretch(1)
         self.tabs.addTab(area, "More")
@@ -272,7 +376,16 @@ class SettingsDialog(QDialog):
 
         vcfg = self._config.setdefault("voice", {})
         vcfg["enabled"] = self.voice_enabled.isChecked()
-        vcfg["speak_responses"] = self.speak_responses.isChecked()
+        vcfg["speak_responses"] = self.voice_speak.isChecked()
+        vcfg["engine"] = self.voice_engine.currentData()
+        try:
+            vcfg["rate"] = int(self.voice_rate.text().strip() or 178)
+        except Exception:
+            vcfg["rate"] = 178
+        ecfg = vcfg.setdefault("elevenlabs", {})
+        ecfg["api_key"] = self.eleven_key.text().strip()
+        ecfg["voice_id"] = self.eleven_voice.text().strip()
+        ecfg.setdefault("model", "eleven_turbo_v2_5")
         ucfg = self._config.setdefault("ui", {})
         ucfg["start_fullscreen"] = self.start_fullscreen.isChecked()
 

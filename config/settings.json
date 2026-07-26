@@ -14,7 +14,13 @@
     "volume": 1.0,
     "voice_hint": "",
     "language": "en-US",
-    "stt_engine": "google"
+    "stt_engine": "google",
+    "engine": "pyttsx3",
+    "elevenlabs": {
+      "api_key": "",
+      "voice_id": "",
+      "model": "eleven_turbo_v2_5"
+    }
   },
   "ui": {
     "start_fullscreen": false,

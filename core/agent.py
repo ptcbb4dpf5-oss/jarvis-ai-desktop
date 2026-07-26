@@ -118,6 +118,10 @@ class Agent:
         if name == "self_modify":
             return self._self_modify(args, speak)
 
+        if name in ("project_create", "project_run", "project_change",
+                    "self_read", "self_duplicate", "self_promote", "self_discard"):
+            return self._projects(name, args, speak, user_text)
+
         if name == "autonomous_task":
             return self.run_autonomous(args.get("goal", user_text))
 
@@ -137,6 +141,18 @@ class Agent:
                 return str(handled)
 
         messages = self.memory.context_messages(SYSTEM_PROMPT)
+
+        # For harder questions, let the ReasoningEngine think harder (reflect /
+        # multi-model debate). It decides automatically and degrades gracefully.
+        reasoning = self.modules.get("reasoning")
+        if reasoning is not None and getattr(self.brain, "is_online", False):
+            try:
+                # Split the conversation context from the latest user turn.
+                history = messages[:-1] if messages else []
+                return reasoning.answer(user_text, context=history, mode="auto")
+            except Exception as exc:
+                self.log(f"[reasoning-fallback] {exc}")
+
         return self.brain.chat(messages)
 
     def _system_stats(self, args: Dict[str, Any], speak: str) -> str:
@@ -193,6 +209,58 @@ class Agent:
             return "Tell me what new ability you'd like me to add."
         result = sm.create_capability(capability, agent=self)
         return (speak + "\n" if speak else "") + result
+
+    def _projects(self, name: str, args: Dict[str, Any], speak: str, user_text: str) -> str:
+        """Route project + self-development intents to the ProjectManager."""
+        pm = self.modules.get("projects")
+        if pm is None:
+            return "The projects engine isn't available."
+        self.set_state(STATE_WORKING)
+        try:
+            if name == "project_create":
+                pname = args.get("name") or "new_project"
+                desc = args.get("description") or user_text
+                self._speak_cb("Designing that now. This can take a moment.")
+                return pm.create_project(pname, desc)
+
+            if name == "project_run":
+                pname = args.get("name") or ""
+                if not pname:
+                    projs = pm.list_projects()
+                    if not projs:
+                        return "You don't have any projects yet. Ask me to build one."
+                    pname = projs[-1]
+                return pm.run_project(pname)
+
+            if name == "project_change":
+                pname = args.get("name") or ""
+                change = args.get("change") or user_text
+                if not pname:
+                    projs = [p for p in pm.list_projects() if not p.startswith("_jarvis_")]
+                    if not projs:
+                        return "There's no project to change yet."
+                    pname = projs[-1]
+                return pm.iterate_project(pname, change)
+
+            if name == "self_read":
+                return pm.read_own_code(args.get("query", ""))
+
+            if name == "self_duplicate":
+                changes = args.get("changes") or user_text
+                self._speak_cb("Making a safe copy of myself and applying that. One moment.")
+                return pm.create_self_duplicate(changes)
+
+            if name == "self_promote":
+                if not pm.has_pending():
+                    return "There's no reviewed change waiting. Ask me to improve myself first."
+                return pm.promote_pending()
+
+            if name == "self_discard":
+                return pm.discard_pending()
+        except Exception as exc:
+            self.log("[projects-error] " + traceback.format_exc())
+            return f"That project action hit a snag: {exc}"
+        return speak or "Done."
 
     # ------------------------------------------------------------------ #
     # Autonomous multi-step task loop

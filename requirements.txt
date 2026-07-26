@@ -4,10 +4,14 @@ PyQt6>=6.6.0
 
 # LLM
 openai>=1.30.0
+requests>=2.31.0        # ElevenLabs voice API + misc HTTP
 
 # System monitoring
 psutil>=5.9.0
 GPUtil>=1.4.0          # optional GPU telemetry (best-effort)
+# CPU/GPU core temperatures on Windows (needs LibreHardwareMonitor or
+# OpenHardwareMonitor running to expose the WMI sensors).
+wmi>=1.5.1 ; platform_system == "Windows"
 
 # Mouse / keyboard / screen control
 PyAutoGUI>=0.9.54

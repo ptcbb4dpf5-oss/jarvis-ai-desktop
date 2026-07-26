@@ -56,6 +56,8 @@ with this schema:
   "intent": one of [
       "chat", "system_stats", "input_control", "app_launch", "app_close",
       "app_install", "app_uninstall", "browser", "self_modify",
+      "project_create", "project_run", "project_change", "self_read",
+      "self_duplicate", "self_promote", "self_discard",
       "autonomous_task", "exit"
   ],
   "args": { ... intent-specific arguments ... },
@@ -71,8 +73,20 @@ Guidelines for args:
   - browser: {"action": "open"|"navigate"|"search"|"click"|"type"|"close",
               "url": str?, "query": str?, "selector": str?, "text": str?}
   - self_modify: {"capability": "plain-English description of the new ability"}
+  - project_create: {"name": "project name", "description": "what it should do"}
+  - project_run: {"name": "project name"}
+  - project_change: {"name": "project name", "change": "what to change"}
+  - self_read: {"query": "optional focus, e.g. 'how does the voice work'"}
+  - self_duplicate: {"changes": "the improvement to make to Jarvis itself"}
+  - self_promote: {}   (user approves applying the reviewed self-change: "update", "apply it", "do it")
+  - self_discard: {}   (user rejects the pending self-change: "discard", "cancel that")
   - autonomous_task: {"goal": "the high-level goal to accomplish"}
   - chat / exit: {}
+
+Notes:
+  - Use project_create when the user asks to build/make/create an app, game, script or website.
+  - Use self_duplicate when the user asks YOU (Jarvis) to change/improve YOURSELF or your own code.
+  - Use self_promote only for short approvals AFTER a self-change was proposed.
 
 Return strictly valid JSON.
 """
@@ -80,6 +94,8 @@ Return strictly valid JSON.
 VALID_INTENTS = {
     "chat", "system_stats", "input_control", "app_launch", "app_close",
     "app_install", "app_uninstall", "browser", "self_modify",
+    "project_create", "project_run", "project_change", "self_read",
+    "self_duplicate", "self_promote", "self_discard",
     "autonomous_task", "exit",
 }
 
